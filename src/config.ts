@@ -16,7 +16,7 @@ export interface GlobalConfig {
 }
 
 export interface RepoConfig {
-  botTag: string;
+  botUsername: string;
   authorizedUsers: string[];
   backend: "claude" | "codex";
   pollIntervalMs: number;
@@ -94,7 +94,7 @@ export function saveGlobalConfig(cfg: GlobalConfig): void {
 export function loadRepoConfig(id: RepoId): RepoConfig {
   const global = loadGlobalConfig();
   const defaults: RepoConfig = {
-    botTag: "@buffalo",
+    botUsername: "",
     authorizedUsers: global.authorizedUsers,
     backend: global.defaultBackend,
     pollIntervalMs: global.pollIntervalMs,
@@ -203,6 +203,10 @@ export function detectAllRemotes(): RemoteInfo[] {
     return remotes;
   } catch {}
   return [];
+}
+
+export function pidFile(id: RepoId): string {
+  return path.join(repoDir(id), "buffalo.pid");
 }
 
 export function getAllRepos(): RepoId[] {

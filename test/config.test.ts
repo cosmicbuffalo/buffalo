@@ -66,8 +66,23 @@ describe("config", () => {
         pollIntervalMs: 60000,
       });
       const id = { owner: "acme", repo: "widgets" };
+      // Save a minimal repo config with only botUsername; other fields fall back to global
+      config.ensureDir(config.repoDir(id));
+      config.saveRepoConfig(id, {
+        botUsername: "acme-bot",
+        authorizedUsers: [],
+        backend: "claude",
+        pollIntervalMs: 0,
+      });
+      // Overwrite with partial config to test fallback
+      const fs = await import("node:fs");
+      const path = await import("node:path");
+      fs.writeFileSync(
+        path.join(config.repoDir(id), "config.json"),
+        JSON.stringify({ botUsername: "acme-bot" }) + "\n"
+      );
       const repoCfg = config.loadRepoConfig(id);
-      assert.equal(repoCfg.botTag, "@buffalo");
+      assert.equal(repoCfg.botUsername, "acme-bot");
       assert.deepEqual(repoCfg.authorizedUsers, ["alice"]);
       assert.equal(repoCfg.backend, "claude");
       assert.equal(repoCfg.pollIntervalMs, 60000);
@@ -77,14 +92,14 @@ describe("config", () => {
       const config = await freshImport<typeof import("../src/config.js")>("../src/config.js");
       const id = { owner: "acme", repo: "widgets" };
       config.saveRepoConfig(id, {
-        botTag: "@buffalo",
+        botUsername: "buffalo-bot",
         authorizedUsers: ["carol"],
         backend: "codex",
         pollIntervalMs: 5000,
         githubToken: "ghp_repo",
       });
       const repoCfg = config.loadRepoConfig(id);
-      assert.equal(repoCfg.botTag, "@buffalo");
+      assert.equal(repoCfg.botUsername, "buffalo-bot");
       assert.deepEqual(repoCfg.authorizedUsers, ["carol"]);
       assert.equal(repoCfg.backend, "codex");
       assert.equal(repoCfg.githubToken, "ghp_repo");
@@ -145,13 +160,13 @@ describe("config", () => {
       const id1 = { owner: "acme", repo: "widgets" };
       const id2 = { owner: "acme", repo: "gadgets" };
       config.saveRepoConfig(id1, {
-        botTag: "@bot",
+        botUsername: "@bot",
         authorizedUsers: [],
         backend: "claude",
         pollIntervalMs: 60000,
       });
       config.saveRepoConfig(id2, {
-        botTag: "@bot",
+        botUsername: "@bot",
         authorizedUsers: [],
         backend: "claude",
         pollIntervalMs: 60000,

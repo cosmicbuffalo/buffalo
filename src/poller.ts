@@ -19,7 +19,7 @@ async function pollRepo(id: RepoId): Promise<void> {
 
   try {
     // Fetch new comments mentioning bot
-    const comments = await fetchNewComments(id, lastPoll, cfg.botTag);
+    const comments = await fetchNewComments(id, lastPoll, `@${cfg.botUsername}`);
 
     // Filter authorized users
     const authorized = comments.filter((c) =>
@@ -51,7 +51,7 @@ async function pollRepo(id: RepoId): Promise<void> {
         }
         continue;
       }
-      if (bodyLower.includes(`${cfg.botTag.toLowerCase()} deny`)) {
+      if (bodyLower.includes(`${`@${cfg.botUsername}`.toLowerCase()} deny`)) {
         const sessions = loadSessions(id);
         for (const [branch, session] of Object.entries(sessions.sessions)) {
           if (session.prNumber === c.prNumber && session.pendingApproval) {
@@ -69,7 +69,7 @@ async function pollRepo(id: RepoId): Promise<void> {
       return (
         !lower.includes("allow once") &&
         !lower.includes("allow always") &&
-        !lower.includes(`${cfg.botTag.toLowerCase()} deny`)
+        !lower.includes(`${`@${cfg.botUsername}`.toLowerCase()} deny`)
       );
     });
 
@@ -104,7 +104,7 @@ async function pollRepo(id: RepoId): Promise<void> {
         const cwd = ensureWorkspace(id, batch.branch, pr.cloneUrl);
 
         // Build prompt
-        const prompt = buildPrompt(batch, cfg.botTag);
+        const prompt = buildPrompt(batch, `@${cfg.botUsername}`);
 
         // Check if there's already an active session
         const existing = getSession(id, batch.branch);

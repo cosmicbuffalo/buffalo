@@ -41,7 +41,7 @@ describe("init", () => {
       const repoId = { owner: "acme", repo: "widgets" };
 
       const saved: RepoConfig = {
-        botTag: "@mybot",
+        botUsername: "mybot",
         authorizedUsers: ["alice", "bob"],
         backend: "codex",
         pollIntervalMs: 30000,
@@ -50,7 +50,7 @@ describe("init", () => {
       config.saveRepoConfig(repoId, saved);
 
       const loaded = config.loadRepoConfig(repoId);
-      assert.equal(loaded.botTag, "@mybot");
+      assert.equal(loaded.botUsername, "mybot");
       assert.deepEqual(loaded.authorizedUsers, ["alice", "bob"]);
       assert.equal(loaded.backend, "codex");
       assert.equal(loaded.githubToken, "ghp_previoustoken123");
@@ -63,7 +63,7 @@ describe("init", () => {
 
       // Simulate first init with custom poll interval
       config.saveRepoConfig(repoId, {
-        botTag: "@buffalo",
+        botUsername: "buffalo-bot",
         authorizedUsers: ["alice"],
         backend: "claude",
         pollIntervalMs: 60000,
@@ -73,7 +73,7 @@ describe("init", () => {
       // Simulate re-init: load existing, save with new values but keep pollIntervalMs
       const existing = config.loadRepoConfig(repoId);
       const updated: RepoConfig = {
-        botTag: "@newbot",
+        botUsername: "newbot",
         authorizedUsers: ["alice", "carol"],
         backend: "codex",
         pollIntervalMs: existing.pollIntervalMs, // preserved
@@ -83,7 +83,7 @@ describe("init", () => {
 
       const reloaded = config.loadRepoConfig(repoId);
       assert.equal(reloaded.pollIntervalMs, 60000);
-      assert.equal(reloaded.botTag, "@newbot");
+      assert.equal(reloaded.botUsername, "newbot");
     });
 
     it("keeps existing token when new token is empty", async () => {
@@ -91,7 +91,7 @@ describe("init", () => {
       const repoId = { owner: "acme", repo: "widgets" };
 
       config.saveRepoConfig(repoId, {
-        botTag: "@buffalo",
+        botUsername: "buffalo-bot",
         authorizedUsers: [],
         backend: "claude",
         pollIntervalMs: 900000,
@@ -109,7 +109,7 @@ describe("init", () => {
       const repoId = { owner: "acme", repo: "widgets" };
 
       config.saveRepoConfig(repoId, {
-        botTag: "@buffalo",
+        botUsername: "buffalo-bot",
         authorizedUsers: [],
         backend: "claude",
         pollIntervalMs: 900000,
@@ -135,7 +135,7 @@ describe("init", () => {
       const config = await import("../src/config.js");
       const repoId = { owner: "acme", repo: "widgets" };
       config.saveRepoConfig(repoId, {
-        botTag: "@buffalo",
+        botUsername: "buffalo-bot",
         authorizedUsers: [],
         backend: "claude",
         pollIntervalMs: 900000,

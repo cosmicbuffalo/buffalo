@@ -113,13 +113,24 @@ export async function runInit(): Promise<void> {
     ]);
     const finalToken = token || existing?.githubToken || "";
 
-    // Bot tag
-    const { botTag } = await prompt([
+    // Bot username
+    console.log(
+      "\n  Buffalo works by monitoring PR comments that @mention a dedicated\n" +
+      "  GitHub bot account. Enter the GitHub username of the bot account\n" +
+      "  that will be used to run Buffalo (e.g. \"my-buffalo-bot\").\n" +
+      "  Comments tagging @<username> on PRs will trigger the bot.\n"
+    );
+    const { botUsername } = await prompt([
       {
         type: "input",
-        name: "botTag",
-        message: "Bot mention tag:",
-        default: existing?.botTag ?? "@buffalo",
+        name: "botUsername",
+        message: "Bot account GitHub username (without @):",
+        default: existing?.botUsername ?? undefined,
+        validate: (v: string) => {
+          if (!v.trim()) return "A bot username is required.";
+          if (v.startsWith("@")) return "Enter the username without the @ prefix.";
+          return true;
+        },
       },
     ]);
 
@@ -151,7 +162,7 @@ export async function runInit(): Promise<void> {
 
     // Save config
     const cfg: RepoConfig = {
-      botTag,
+      botUsername: botUsername.trim(),
       authorizedUsers,
       backend,
       pollIntervalMs: existing?.pollIntervalMs ?? 15 * 60 * 1000,
@@ -171,5 +182,5 @@ export async function runInit(): Promise<void> {
   }
 
   console.log(`\nRemember to add the bot user as a collaborator on each repo.`);
-  console.log(`Run \`buffalo start\` to begin polling.\n`);
+  console.log(`Run \`buffalo start\` to begin polling in the background.\n`);
 }

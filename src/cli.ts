@@ -1,13 +1,17 @@
-import { execSync } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
+import * as path from "node:path";
 import {
   type RepoId,
   detectRepoFromCwd,
+  detectAllRemotes,
   getAllRepos,
   loadWhitelist,
   saveGlobalWhitelist,
   loadRepoConfig,
   logFile,
+  pidFile,
+  repoDir,
 } from "./config.js";
 import { attachToWindow, listWindows } from "./tmux-manager.js";
 import { pauseSession, resumeSession, loadSessions } from "./session-store.js";
@@ -35,6 +39,92 @@ function requireRepo(): RepoId {
   return id;
 }
 
+function parseRepoArg(arg: string): RepoId | null {
+  const parts = arg.split("/");
+  if (parts.length === 2 && parts[0] && parts[1]) {
+    return { owner: parts[0], repo: parts[1] };
+  }
+  return null;
+}
+
+function hasExistingConfig(id: RepoId): boolean {
+  return fs.existsSync(
+    path.join(repoDir(id), "config.json")
+  );
+}
+
+/**
+ * Resolve which repos to target for start/stop.
+ * - Explicit arg: use that repo (must be initialized)
+ * - In a git repo: use all initialized remotes (error if none)
+ * - Not in a repo and no arg: error
+ */
+function resolveTargetRepos(rest: string[]): RepoId[] {
+  const explicit = rest[0] ? parseRepoArg(rest[0]) : null;
+
+  if (explicit) {
+    if (!hasExistingConfig(explicit)) {
+      console.error(
+        `${explicit.owner}/${explicit.repo} is not an initialized Buffalo repo.\n` +
+        `Run \`buffalo init\` in the repo directory first.`
+      );
+      process.exit(1);
+    }
+    return [explicit];
+  }
+
+  // Try detecting from cwd
+  const remotes = detectAllRemotes();
+  if (remotes.length === 0) {
+    console.error(
+      "Not in a git repository and no repo specified.\n" +
+      "Usage: buffalo start <owner>/<repo>\n" +
+      "   or: run from inside a git repo that has been initialized with `buffalo init`."
+    );
+    process.exit(1);
+  }
+
+  const initialized = remotes.filter((r) =>
+    hasExistingConfig({ owner: r.owner, repo: r.repo })
+  );
+
+  if (initialized.length === 0) {
+    console.error(
+      "This repository has not been initialized with Buffalo.\n" +
+      "Run `buffalo init` first to set up this repo."
+    );
+    process.exit(1);
+  }
+
+  return initialized.map((r) => ({ owner: r.owner, repo: r.repo }));
+}
+
+function isProcessRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function writePidFile(id: RepoId, pid: number): void {
+  fs.writeFileSync(pidFile(id), String(pid));
+}
+
+function readPidFile(id: RepoId): number | null {
+  try {
+    const pid = parseInt(fs.readFileSync(pidFile(id), "utf-8").trim(), 10);
+    return isNaN(pid) ? null : pid;
+  } catch {
+    return null;
+  }
+}
+
+function removePidFile(id: RepoId): void {
+  try { fs.unlinkSync(pidFile(id)); } catch {}
+}
+
 export async function dispatch(args: string[]): Promise<void> {
   const cmd = args[0];
   const rest = args.slice(1);
@@ -45,18 +135,63 @@ export async function dispatch(args: string[]): Promise<void> {
       break;
 
     case "start": {
-      const id = detectRepoFromCwd();
-      const repos = id ? [id] : getAllRepos();
-      startPolling(repos);
-      // Keep process alive
-      process.on("SIGINT", () => { stopPolling(); process.exit(0); });
-      process.on("SIGTERM", () => { stopPolling(); process.exit(0); });
+      // Internal flag: run in foreground (used by spawned background process)
+      if (rest.includes("--_foreground")) {
+        const repoArg = rest.find((a) => a !== "--_foreground");
+        const id = repoArg ? parseRepoArg(repoArg) : null;
+        if (!id) { console.error("Internal error: no repo for foreground mode"); process.exit(1); }
+        writePidFile(id, process.pid);
+        startPolling([id]);
+        process.on("SIGINT", () => { stopPolling(); removePidFile(id); process.exit(0); });
+        process.on("SIGTERM", () => { stopPolling(); removePidFile(id); process.exit(0); });
+        break;
+      }
+
+      const repos = resolveTargetRepos(rest);
+      for (const id of repos) {
+        const existingPid = readPidFile(id);
+        if (existingPid && isProcessRunning(existingPid)) {
+          console.log(`${id.owner}/${id.repo}: already running (pid ${existingPid})`);
+          continue;
+        }
+
+        // Spawn a detached background process for this repo
+        const logPath = path.join(repoDir(id), "logs", "daemon.log");
+        const out = fs.openSync(logPath, "a");
+        // Re-invoke the same entry point with --_foreground flag
+        const child = spawn(
+          process.argv[0],
+          [process.argv[1], "start", "--_foreground", `${id.owner}/${id.repo}`],
+          {
+            detached: true,
+            stdio: ["ignore", out, out],
+          }
+        );
+        child.unref();
+        console.log(`${id.owner}/${id.repo}: started in background (pid ${child.pid})`);
+      }
       break;
     }
 
-    case "stop":
-      stopPolling();
+    case "stop": {
+      const repos = resolveTargetRepos(rest);
+      for (const id of repos) {
+        const pid = readPidFile(id);
+        if (!pid || !isProcessRunning(pid)) {
+          removePidFile(id);
+          console.log(`${id.owner}/${id.repo}: not running`);
+          continue;
+        }
+        try {
+          process.kill(pid, "SIGTERM");
+          removePidFile(id);
+          console.log(`${id.owner}/${id.repo}: stopped (pid ${pid})`);
+        } catch (err) {
+          console.error(`${id.owner}/${id.repo}: failed to stop (pid ${pid}):`, err);
+        }
+      }
       break;
+    }
 
     case "status": {
       const repos = getAllRepos();
@@ -65,7 +200,9 @@ export async function dispatch(args: string[]): Promise<void> {
         break;
       }
       for (const id of repos) {
-        console.log(`\n${id.owner}/${id.repo}:`);
+        const pid = readPidFile(id);
+        const polling = pid && isProcessRunning(pid) ? `polling (pid ${pid})` : "not polling";
+        console.log(`\n${id.owner}/${id.repo}: [${polling}]`);
         const sessions = loadSessions(id);
         const entries = Object.entries(sessions.sessions);
         if (entries.length === 0) {
@@ -199,19 +336,19 @@ export async function dispatch(args: string[]): Promise<void> {
       console.log(`Buffalo — GitHub PR Collaborator Bot
 
 Usage:
-  buffalo init                  Set up a repo
-  buffalo start                 Start polling
-  buffalo stop                  Stop polling
-  buffalo status                Show repos and sessions
-  buffalo attach [branch]       Attach to tmux window
-  buffalo pause [branch]        Pause a session
-  buffalo resume [branch]       Resume a session
-  buffalo list                  List active tmux windows
-  buffalo logs [branch]         Tail log for a branch
-  buffalo history [branch]      Show action history
-  buffalo whitelist             Show command whitelist
-  buffalo whitelist add <pat>   Add whitelist pattern
-  buffalo whitelist remove <i>  Remove pattern by index
+  buffalo init                        Set up a repo
+  buffalo start [owner/repo]          Start polling in background
+  buffalo stop [owner/repo]           Stop polling
+  buffalo status                      Show repos and sessions
+  buffalo attach [branch]             Attach to tmux window
+  buffalo pause [branch]              Pause a session
+  buffalo resume [branch]             Resume a session
+  buffalo list                        List active tmux windows
+  buffalo logs [branch]               Tail log for a branch
+  buffalo history [branch]            Show action history
+  buffalo whitelist                   Show command whitelist
+  buffalo whitelist add <pat>         Add whitelist pattern
+  buffalo whitelist remove <i>        Remove pattern by index
 `);
   }
 }
