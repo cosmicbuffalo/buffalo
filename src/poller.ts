@@ -1,13 +1,35 @@
-import { type RepoId, loadRepoConfig, getAllRepos } from "./config.js";
+import { type RepoId, loadRepoConfig, getAllRepos, workspaceDir } from "./config.js";
 import { fetchPRComments, listOpenPRs, getPullRequest, postComment, reactToComment } from "./github.js";
 import { loadSeenCommentIds, saveSeenCommentIds, loadSessions, getSession, setSession, removeSession, markBranchResumable, clearBranchResumable } from "./session-store.js";
 import { ensureWorkspace, commitAndPush, checkAndCleanupMergedPR } from "./repo-manager.js";
 import { startCliSession, monitorSession, handleApproval, readSessionOutput } from "./cli-runner.js";
-import { batchComments, buildPrompt, buildClarificationFollowUp, extractCommitMessage, extractClarification } from "./batch.js";
+import { batchComments, buildPrompt, buildClarificationFollowUp, extractCommitMessage, extractClarification, stripDirectives } from "./batch.js";
 import { appendHistory } from "./history.js";
 
 let running = false;
 let pollTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * Replace local workspace file paths in markdown links with GitHub blob URLs.
+ * Codex writes links using the absolute local workspace path; we rewrite them
+ * to https://github.com/<owner>/<repo>/blob/<branch>/<relative-path>.
+ */
+function rewriteLocalPaths(text: string, id: RepoId, branch: string): string {
+  const base = workspaceDir(id, branch);
+  const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+  // Rewrite markdown links with local paths to GitHub blob URLs
+  let result = text.replace(
+    new RegExp(`\\[([^\\]]+)\\]\\(${escaped}/([^)]+)\\)`, "g"),
+    (_, linkText, relPath) =>
+      `[${linkText}](https://github.com/${id.owner}/${id.repo}/blob/${branch}/${relPath})`
+  );
+
+  // Strip the workspace prefix from any remaining bare paths, leaving just the relative path
+  result = result.replace(new RegExp(`${escaped}/`, "g"), "");
+
+  return result;
+}
 
 /**
  * Run one poll cycle for a single repo.
@@ -254,12 +276,15 @@ async function pollRepo(id: RepoId): Promise<void> {
           parts.push(`#### Tokens used: ${tokensUsed.toLocaleString()}`);
         }
 
-        if (response) {
+        const displayResponse = stripDirectives(
+          response ? rewriteLocalPaths(response, id, branch) : null
+        );
+        if (displayResponse) {
           parts.push("");
           const backendName = cfg.backend === "claude" ? "Claude" : "Codex";
           parts.push(`## ${backendName}'s response:`);
           parts.push("");
-          parts.push(response);
+          parts.push(displayResponse);
         }
 
         const commentBody = parts.join("\n").trim() || null;

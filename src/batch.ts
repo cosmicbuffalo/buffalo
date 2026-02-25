@@ -98,22 +98,46 @@ export function buildClarificationFollowUp(
   return lines.join("\n");
 }
 
+// Matches an optional leading numbered-list prefix like "1. " or "2. "
+const LIST_PREFIX = /^(?:\d+\.\s*)?/;
+
+/**
+ * Strip bot-directive lines (COMMIT: / CLARIFICATION_NEEDED:) from a response
+ * before posting it to GitHub — they're internal signals, not human-readable output.
+ * If removing directives leaves only a single numbered bullet, its "1. " prefix is
+ * also stripped (a one-item list isn't a list).
+ */
+export function stripDirectives(response: string | null): string | null {
+  if (!response) return null;
+  const directivePat = new RegExp(`${LIST_PREFIX.source}(?:COMMIT|CLARIFICATION_NEEDED):\\s*`, "i");
+  const bulletPat = /^\d+\.\s+/;
+
+  const filtered = response.split("\n").filter((line) => !directivePat.test(line));
+
+  const bulletCount = filtered.filter((l) => bulletPat.test(l)).length;
+  const lines = bulletCount === 1
+    ? filtered.map((l) => l.replace(bulletPat, ""))
+    : filtered;
+
+  return lines.join("\n").trim() || null;
+}
+
 /**
  * Extract the suggested commit message from the agent's response.
- * Looks for a line starting with "COMMIT: " (case-insensitive).
+ * Handles lines like "COMMIT: ..." or "2. COMMIT: ..." (numbered list format).
  */
 export function extractCommitMessage(response: string | null): string | null {
   if (!response) return null;
-  const match = response.match(/^COMMIT:\s*(.+)$/im);
+  const match = response.match(new RegExp(`${LIST_PREFIX.source}COMMIT:\\s*(.+)$`, "im"));
   return match?.[1]?.trim() ?? null;
 }
 
 /**
  * Extract a clarification question from the agent's response.
- * Looks for a line starting with "CLARIFICATION_NEEDED: " (case-insensitive).
+ * Handles lines like "CLARIFICATION_NEEDED: ..." or "2. CLARIFICATION_NEEDED: ...".
  */
 export function extractClarification(response: string | null): string | null {
   if (!response) return null;
-  const match = response.match(/^CLARIFICATION_NEEDED:\s*(.+)$/im);
+  const match = response.match(new RegExp(`${LIST_PREFIX.source}CLARIFICATION_NEEDED:\\s*(.+)$`, "im"));
   return match?.[1]?.trim() ?? null;
 }
