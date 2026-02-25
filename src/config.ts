@@ -94,7 +94,7 @@ export function saveGlobalConfig(cfg: GlobalConfig): void {
 export function loadRepoConfig(id: RepoId): RepoConfig {
   const global = loadGlobalConfig();
   const defaults: RepoConfig = {
-    botTag: "@bot",
+    botTag: "@buffalo",
     authorizedUsers: global.authorizedUsers,
     backend: global.defaultBackend,
     pollIntervalMs: global.pollIntervalMs,

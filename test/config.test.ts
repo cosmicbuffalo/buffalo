@@ -67,7 +67,7 @@ describe("config", () => {
       });
       const id = { owner: "acme", repo: "widgets" };
       const repoCfg = config.loadRepoConfig(id);
-      assert.equal(repoCfg.botTag, "@bot");
+      assert.equal(repoCfg.botTag, "@buffalo");
       assert.deepEqual(repoCfg.authorizedUsers, ["alice"]);
       assert.equal(repoCfg.backend, "claude");
       assert.equal(repoCfg.pollIntervalMs, 60000);

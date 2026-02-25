@@ -62,7 +62,7 @@ export async function runInit(): Promise<void> {
       type: "input",
       name: "botTag",
       message: "Bot mention tag:",
-      default: "@bot",
+      default: "@buffalo",
     },
   ]);
 
