@@ -166,15 +166,43 @@ export function initBuffaloDir(): void {
 }
 
 export function detectRepoFromCwd(): RepoId | null {
+  const remotes = detectAllRemotes();
+  return remotes.find((r) => r.remoteName === "origin") ?? remotes[0] ?? null;
+}
+
+export interface RemoteInfo extends RepoId {
+  remoteName: string;
+  url: string;
+}
+
+export function detectAllRemotes(): RemoteInfo[] {
   try {
-    const remote = execSync("git remote get-url origin", {
+    const output = execSync("git remote -v", {
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "pipe"],
     }).trim();
-    const match = remote.match(/github\.com[:/]([^/]+)\/([^/.]+)/);
-    if (match) return { owner: match[1], repo: match[2] };
+    if (!output) return [];
+
+    const seen = new Set<string>();
+    const remotes: RemoteInfo[] = [];
+
+    for (const line of output.split("\n")) {
+      // Only look at fetch lines to avoid duplicates (fetch + push)
+      if (!line.includes("(fetch)")) continue;
+      const parts = line.split(/\s+/);
+      const remoteName = parts[0];
+      const url = parts[1];
+      const match = url.match(/github\.com[:/]([^/]+)\/([^/.]+)/);
+      if (!match) continue;
+      const key = `${match[1]}/${match[2]}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      remotes.push({ remoteName, url, owner: match[1], repo: match[2] });
+    }
+
+    return remotes;
   } catch {}
-  return null;
+  return [];
 }
 
 export function getAllRepos(): RepoId[] {
