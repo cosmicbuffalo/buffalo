@@ -10,16 +10,8 @@ Code review bots that run in opaque containers give you no visibility and no esc
 
 ## Install
 
-**From npm:**
-
 ```bash
-npm install -g buffalo
-```
-
-**From source:**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/<owner>/buffalo/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/cosmicbuffalo/buffalo/main/install.sh | sh
 ```
 
 Requires **Node >= 22** and **tmux**.

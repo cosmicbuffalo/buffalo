@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-REPO_URL="https://github.com/owner/buffalo.git"
+REPO_URL="https://github.com/cosmicbuffalo/buffalo.git"
 INSTALL_DIR="${BUFFALO_INSTALL_DIR:-$HOME/.buffalo-cli}"
 
 echo "🦬 Installing Buffalo — GitHub PR Collaborator Bot"

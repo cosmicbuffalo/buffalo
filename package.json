@@ -1,6 +1,6 @@
 {
   "name": "buffalo",
-  "version": "1.0.0",
+  "version": "0.0.1",
   "description": "Self-hosted GitHub PR collaborator bot",
   "main": "dist/src/index.js",
   "bin": {
