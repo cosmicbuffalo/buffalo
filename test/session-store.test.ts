@@ -106,13 +106,15 @@ describe("session-store", () => {
     assert.equal(store.resumeSession(repoId, "feature"), false);
   });
 
-  it("saves and loads last poll timestamp", async () => {
+  it("saves and loads seen comment IDs", async () => {
     const store = await freshImport<typeof import("../src/session-store.js")>(
       "../src/session-store.js"
     );
-    assert.equal(store.loadLastPoll(repoId), null);
-    store.saveLastPoll(repoId, "2026-01-01T00:00:00Z");
-    assert.equal(store.loadLastPoll(repoId), "2026-01-01T00:00:00Z");
+    assert.deepEqual([...store.loadSeenCommentIds(repoId)], []);
+    const seen = new Set<number>([101, 202, 303]);
+    store.saveSeenCommentIds(repoId, seen);
+    const loaded = store.loadSeenCommentIds(repoId);
+    assert.deepEqual([...loaded].sort((a, b) => a - b), [101, 202, 303]);
   });
 
   it("preserves multiple sessions independently", async () => {

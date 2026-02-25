@@ -1,9 +1,9 @@
 import { execSync } from "node:child_process";
 import * as fs from "node:fs";
-import { type RepoId, workspaceDir, ensureDir, loadGlobalConfig, loadRepoConfig } from "./config.js";
+import { type RepoId, workspaceDir, ensureDir } from "./config.js";
 import { appendHistory } from "./history.js";
 import { destroyWindow } from "./tmux-manager.js";
-import { removeSession } from "./session-store.js";
+import { removeSession, clearBranchResumable } from "./session-store.js";
 import { getPullRequest } from "./github.js";
 
 function run(cmd: string, cwd?: string): string {
@@ -37,15 +37,13 @@ export function ensureWorkspace(
 
   ensureDir(dir);
 
-  // Build clone URL with token for auth
-  const token = loadRepoConfig(id).githubToken || loadGlobalConfig().githubToken;
-  let authUrl = cloneUrl;
-  if (token && cloneUrl.startsWith("https://")) {
-    authUrl = cloneUrl.replace("https://", `https://x-access-token:${token}@`);
-  }
+  // Convert HTTPS clone URL to SSH so git uses the machine's existing SSH key
+  // rather than needing a PAT embedded in the URL.
+  // https://github.com/owner/repo.git  →  git@github.com:owner/repo.git
+  const sshUrl = cloneUrl.replace(/^https:\/\/([^/]+)\//, "git@$1:");
 
   run(
-    `git clone --depth=1 --single-branch --branch ${branch} ${authUrl} ${dir}`
+    `git clone --depth=1 --single-branch --branch ${branch} ${sshUrl} ${dir}`
   );
 
   return dir;
@@ -92,8 +90,9 @@ export async function checkAndCleanupMergedPR(
   // Destroy tmux window
   destroyWindow(id, branch);
 
-  // Remove session tracking
+  // Remove session tracking and clear codex resume state
   removeSession(id, branch);
+  clearBranchResumable(id, branch);
 
   // Optionally remove workspace (keep history)
   const dir = workspaceDir(id, branch);

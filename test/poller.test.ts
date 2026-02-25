@@ -82,13 +82,14 @@ describe("poller", () => {
   });
 
   describe("last poll persistence", () => {
-    it("saves and loads poll timestamp", async () => {
+    it("saves and loads seen comment IDs", async () => {
       const store = await freshImport<typeof import("../src/session-store.js")>(
         "../src/session-store.js"
       );
-      const ts = "2026-02-25T10:00:00Z";
-      store.saveLastPoll(repoId, ts);
-      assert.equal(store.loadLastPoll(repoId), ts);
+      const seen = new Set<number>([1, 2, 3]);
+      store.saveSeenCommentIds(repoId, seen);
+      const loaded = store.loadSeenCommentIds(repoId);
+      assert.deepEqual([...loaded].sort(), [1, 2, 3]);
     });
   });
 });

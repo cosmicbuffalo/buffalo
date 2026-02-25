@@ -1,10 +1,25 @@
-import { Octokit } from "@octokit/rest";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { type RepoId, loadGlobalConfig, loadRepoConfig } from "./config.js";
 
-function getOctokit(id: RepoId): Octokit {
+const execFileAsync = promisify(execFile);
+
+/** Run gh and parse JSON output. Pass botToken to authenticate as the bot account. */
+async function ghJson<T>(args: string[], botToken?: string): Promise<T> {
+  const env = botToken ? { ...process.env, GH_TOKEN: botToken } : process.env;
+  const { stdout } = await execFileAsync("gh", args, { env });
+  return JSON.parse(stdout) as T;
+}
+
+/** Run gh without capturing output. Pass botToken to authenticate as the bot account. */
+async function ghRun(args: string[], botToken?: string): Promise<void> {
+  const env = botToken ? { ...process.env, GH_TOKEN: botToken } : process.env;
+  await execFileAsync("gh", args, { env });
+}
+
+function getBotToken(id: RepoId): string | undefined {
   const repoCfg = loadRepoConfig(id);
-  const token = repoCfg.githubToken || loadGlobalConfig().githubToken;
-  return new Octokit({ auth: token });
+  return repoCfg.githubToken || loadGlobalConfig().githubToken || undefined;
 }
 
 export interface PRComment {
@@ -26,41 +41,46 @@ export interface PullRequest {
 }
 
 /**
- * Fetch issue comments since a given timestamp, filtering for @bot mentions.
+ * Fetch all comments on a specific PR mentioning the bot.
+ * Checks both PR discussion comments and inline review comments.
  */
-export async function fetchNewComments(
+export async function fetchPRComments(
   id: RepoId,
-  since: string,
+  prNumber: number,
   botTag: string
 ): Promise<PRComment[]> {
-  const octokit = getOctokit(id);
+  const [issueComments, reviewComments] = await Promise.all([
+    ghJson<any[]>(["api", `repos/${id.owner}/${id.repo}/issues/${prNumber}/comments?per_page=100`]),
+    ghJson<any[]>(["api", `repos/${id.owner}/${id.repo}/pulls/${prNumber}/comments?per_page=100`]),
+  ]);
+
   const comments: PRComment[] = [];
 
-  const { data } = await octokit.issues.listCommentsForRepo({
-    owner: id.owner,
-    repo: id.repo,
-    since,
-    sort: "created",
-    direction: "asc",
-    per_page: 100,
-  });
-
-  for (const c of data) {
+  for (const c of issueComments) {
     if (!c.body?.includes(botTag)) continue;
-    // Extract PR number from issue_url
-    const prMatch = c.issue_url?.match(/\/issues\/(\d+)$/);
-    if (!prMatch) continue;
-
     comments.push({
       id: c.id,
       body: c.body,
       user: c.user?.login ?? "",
-      prNumber: parseInt(prMatch[1], 10),
+      prNumber,
       createdAt: c.created_at,
       htmlUrl: c.html_url ?? "",
     });
   }
 
+  for (const c of reviewComments) {
+    if (!c.body?.includes(botTag)) continue;
+    comments.push({
+      id: c.id,
+      body: c.body,
+      user: c.user?.login ?? "",
+      prNumber,
+      createdAt: c.created_at,
+      htmlUrl: c.html_url ?? "",
+    });
+  }
+
+  comments.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   return comments;
 }
 
@@ -71,76 +91,86 @@ export async function getPullRequest(
   id: RepoId,
   prNumber: number
 ): Promise<PullRequest> {
-  const octokit = getOctokit(id);
-  const { data } = await octokit.pulls.get({
-    owner: id.owner,
-    repo: id.repo,
-    pull_number: prNumber,
-  });
+  const data = await ghJson<any>([
+    "pr", "view", String(prNumber),
+    "--repo", `${id.owner}/${id.repo}`,
+    "--json", "number,headRefName,mergedAt,state,title,headRepository",
+  ]);
+
+  const cloneUrl = data.headRepository?.url
+    ? `${data.headRepository.url}.git`
+    : `https://github.com/${id.owner}/${id.repo}.git`;
 
   return {
     number: data.number,
-    branch: data.head.ref,
-    merged: data.merged ?? false,
-    state: data.state,
+    branch: data.headRefName,
+    merged: data.mergedAt != null,
+    state: (data.state ?? "").toLowerCase(),
     title: data.title,
-    cloneUrl: data.head.repo?.clone_url ?? `https://github.com/${id.owner}/${id.repo}.git`,
+    cloneUrl,
   };
 }
 
 /**
- * Post a comment on a PR.
+ * Post a comment on a PR. Uses the configured bot token so the comment
+ * appears from the bot account.
  */
 export async function postComment(
   id: RepoId,
   prNumber: number,
   body: string
 ): Promise<number> {
-  const octokit = getOctokit(id);
-  const { data } = await octokit.issues.createComment({
-    owner: id.owner,
-    repo: id.repo,
-    issue_number: prNumber,
-    body,
-  });
+  const data = await ghJson<any>([
+    "api",
+    `repos/${id.owner}/${id.repo}/issues/${prNumber}/comments`,
+    "--method", "POST",
+    "-f", `body=${body}`,
+  ], getBotToken(id));
   return data.id;
 }
 
 /**
- * React to a comment (e.g., "eyes" to acknowledge).
+ * React to a comment (e.g., "eyes" to acknowledge). Uses the configured
+ * bot token so the reaction appears from the bot account.
+ * Failures are logged but not thrown — reactions are non-critical UX.
  */
 export async function reactToComment(
   id: RepoId,
   commentId: number,
   reaction: "+1" | "-1" | "laugh" | "confused" | "heart" | "hooray" | "rocket" | "eyes"
 ): Promise<void> {
-  const octokit = getOctokit(id);
-  await octokit.reactions.createForIssueComment({
-    owner: id.owner,
-    repo: id.repo,
-    comment_id: commentId,
-    content: reaction,
-  });
+  try {
+    await ghRun([
+      "api",
+      `repos/${id.owner}/${id.repo}/issues/comments/${commentId}/reactions`,
+      "--method", "POST",
+      "-f", `content=${reaction}`,
+    ], getBotToken(id));
+  } catch (err: any) {
+    console.warn(`[buffalo] Warning: could not react to comment ${commentId} (${err.message?.split("\n")[0]})`);
+  }
 }
 
 /**
  * List open PRs for the repo.
  */
 export async function listOpenPRs(id: RepoId): Promise<PullRequest[]> {
-  const octokit = getOctokit(id);
-  const { data } = await octokit.pulls.list({
-    owner: id.owner,
-    repo: id.repo,
-    state: "open",
-    per_page: 100,
-  });
+  const data = await ghJson<any[]>([
+    "pr", "list",
+    "--repo", `${id.owner}/${id.repo}`,
+    "--state", "open",
+    "--json", "number,headRefName,state,title,headRepository",
+    "--limit", "100",
+  ]);
 
   return data.map((pr) => ({
     number: pr.number,
-    branch: pr.head.ref,
+    branch: pr.headRefName,
     merged: false,
-    state: pr.state,
+    state: (pr.state ?? "").toLowerCase(),
     title: pr.title,
-    cloneUrl: pr.head.repo?.clone_url ?? `https://github.com/${id.owner}/${id.repo}.git`,
+    cloneUrl: pr.headRepository?.url
+      ? `${pr.headRepository.url}.git`
+      : `https://github.com/${id.owner}/${id.repo}.git`,
   }));
 }

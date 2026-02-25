@@ -1,9 +1,9 @@
 import { type RepoId, loadRepoConfig, getAllRepos } from "./config.js";
-import { fetchNewComments, getPullRequest, postComment, reactToComment } from "./github.js";
-import { loadLastPoll, saveLastPoll, loadSessions, getSession, setSession } from "./session-store.js";
+import { fetchPRComments, listOpenPRs, getPullRequest, postComment, reactToComment } from "./github.js";
+import { loadSeenCommentIds, saveSeenCommentIds, loadSessions, getSession, setSession, removeSession, markBranchResumable, clearBranchResumable } from "./session-store.js";
 import { ensureWorkspace, commitAndPush, checkAndCleanupMergedPR } from "./repo-manager.js";
-import { startCliSession, monitorSession, handleApproval } from "./cli-runner.js";
-import { batchComments, buildPrompt } from "./batch.js";
+import { startCliSession, monitorSession, handleApproval, readSessionOutput } from "./cli-runner.js";
+import { batchComments, buildPrompt, buildClarificationFollowUp, extractCommitMessage, extractClarification } from "./batch.js";
 import { appendHistory } from "./history.js";
 
 let running = false;
@@ -14,17 +14,29 @@ let pollTimer: ReturnType<typeof setTimeout> | null = null;
  */
 async function pollRepo(id: RepoId): Promise<void> {
   const cfg = loadRepoConfig(id);
-  const lastPoll = loadLastPoll(id) ?? new Date(Date.now() - cfg.pollIntervalMs).toISOString();
-  const now = new Date().toISOString();
 
   try {
-    // Fetch new comments mentioning bot
-    const comments = await fetchNewComments(id, lastPoll, `@${cfg.botUsername}`);
+    const repoLabel = `${id.owner}/${id.repo}`;
+    console.log(`[buffalo] Polling ${repoLabel}`);
+
+    // List all open PRs and collect unaddressed bot-mention comments
+    const openPRs = await listOpenPRs(id);
+    console.log(`[buffalo] ${repoLabel}: ${openPRs.length} open PR(s)`);
+
+    const seenIds = loadSeenCommentIds(id);
+    const botTag = `@${cfg.botUsername}`;
+    const allComments = (
+      await Promise.all(openPRs.map((pr) => fetchPRComments(id, pr.number, botTag)))
+    ).flat().filter((c) => !seenIds.has(c.id));
+    allComments.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+
+    console.log(`[buffalo] ${repoLabel}: ${allComments.length} unaddressed comment(s) mentioning ${botTag}`);
 
     // Filter authorized users
-    const authorized = comments.filter((c) =>
-      cfg.authorizedUsers.includes(c.user)
-    );
+    const authorized = allComments.filter((c) => cfg.authorizedUsers.includes(c.user));
+    if (allComments.length > 0) {
+      console.log(`[buffalo] ${repoLabel}: ${authorized.length} from authorized user(s)`);
+    }
 
     // Check for approval responses
     for (const c of authorized) {
@@ -37,6 +49,7 @@ async function pollRepo(id: RepoId): Promise<void> {
             await reactToComment(id, c.id, "+1");
           }
         }
+        seenIds.add(c.id);
         continue;
       }
       if (bodyLower.includes("allow always")) {
@@ -49,6 +62,7 @@ async function pollRepo(id: RepoId): Promise<void> {
             await reactToComment(id, c.id, "+1");
           }
         }
+        seenIds.add(c.id);
         continue;
       }
       if (bodyLower.includes(`${`@${cfg.botUsername}`.toLowerCase()} deny`)) {
@@ -59,6 +73,7 @@ async function pollRepo(id: RepoId): Promise<void> {
             await reactToComment(id, c.id, "+1");
           }
         }
+        seenIds.add(c.id);
         continue;
       }
     }
@@ -87,7 +102,8 @@ async function pollRepo(id: RepoId): Promise<void> {
       const batches = batchComments(taskComments, branchMap);
 
       for (const batch of batches) {
-        // Log comment detection
+        // Log comment detection and tentatively mark seen.
+        // If anything below fails, we'll roll back these IDs.
         for (const c of batch.comments) {
           appendHistory(id, batch.branch, {
             type: "comment_detected",
@@ -97,33 +113,58 @@ async function pollRepo(id: RepoId): Promise<void> {
             body: c.body,
           });
           await reactToComment(id, c.id, "eyes");
+          seenIds.add(c.id);
         }
 
-        // Ensure workspace
-        const pr = await getPullRequest(id, batch.prNumber);
-        const cwd = ensureWorkspace(id, batch.branch, pr.cloneUrl);
+        try {
+          // Ensure workspace
+          const pr = await getPullRequest(id, batch.prNumber);
+          const cwd = ensureWorkspace(id, batch.branch, pr.cloneUrl);
 
-        // Build prompt
-        const prompt = buildPrompt(batch, `@${cfg.botUsername}`);
+          const existing = getSession(id, batch.branch);
 
-        // Check if there's already an active session
-        const existing = getSession(id, batch.branch);
-        if (existing && existing.status === "running") {
-          // Send follow-up to existing session
-          // Send follow-up to existing session
-          const tmux = await import("./tmux-manager.js");
-          tmux.sendKeys(id, batch.branch, prompt);
-        } else {
-          // Start new CLI session
-          startCliSession(id, batch.branch, prompt, cwd, batch.prNumber);
-
-          setSession(id, batch.branch, {
-            branch: batch.branch,
-            prNumber: batch.prNumber,
-            commentIds: batch.comments.map((c) => c.id),
-            status: "running",
-            logOffset: 0,
-          });
+          if (existing?.status === "waiting_clarification" && existing.pendingClarification) {
+            // The new comment is a clarification answer — resume the original task.
+            const followUpPrompt = buildClarificationFollowUp(existing, batch, `@${cfg.botUsername}`);
+            startCliSession(id, batch.branch, followUpPrompt, cwd, batch.prNumber);
+            setSession(id, batch.branch, {
+              branch: batch.branch,
+              prNumber: batch.prNumber,
+              commentIds: [...existing.commentIds, ...batch.comments.map((c) => c.id)],
+              triggerComments: [
+                ...(existing.triggerComments ?? []),
+                ...batch.comments.map((c) => ({ user: c.user, body: c.body })),
+              ],
+              status: "running",
+              logOffset: 0,
+            });
+            appendHistory(id, batch.branch, {
+              type: "clarification_answered",
+              pr: batch.prNumber,
+              answer: batch.comments.map((c) => c.body).join("\n"),
+            });
+          } else if (existing?.status === "running") {
+            // Session already running — send the new comment as additional input.
+            const tmux = await import("./tmux-manager.js");
+            tmux.sendKeys(id, batch.branch, buildPrompt(batch, `@${cfg.botUsername}`));
+          } else {
+            // Fresh session.
+            startCliSession(id, batch.branch, buildPrompt(batch, `@${cfg.botUsername}`), cwd, batch.prNumber);
+            setSession(id, batch.branch, {
+              branch: batch.branch,
+              prNumber: batch.prNumber,
+              commentIds: batch.comments.map((c) => c.id),
+              triggerComments: batch.comments.map((c) => ({
+                user: c.user,
+                body: c.body,
+              })),
+              status: "running",
+              logOffset: 0,
+            });
+          }
+        } catch (err) {
+          console.error(`[buffalo] Failed to start session for ${batch.branch}, will retry:`, err);
+          for (const c of batch.comments) seenIds.delete(c.id);
         }
       }
     }
@@ -133,12 +174,44 @@ async function pollRepo(id: RepoId): Promise<void> {
     for (const [branch, session] of Object.entries(sessions.sessions)) {
       if (session.status === "paused") continue;
       if (session.status === "waiting_approval") continue;
+      if (session.status === "waiting_clarification") continue;
 
       const result = await monitorSession(id, branch);
 
       if (result === "completed") {
-        // Try to commit and push
-        const sha = commitAndPush(id, branch, `buffalo: address PR #${session.prNumber} feedback`);
+        const { response, tokensUsed } = readSessionOutput(id, branch);
+
+        // Check if the agent is asking for clarification before committing.
+        const clarificationQuestion = extractClarification(response);
+        if (clarificationQuestion) {
+          const triggers = session.triggerComments ?? [];
+          const mentions = [...new Set(triggers.map((c) => `@${c.user}`))].join(" ");
+          const commentId = await postComment(
+            id,
+            session.prNumber,
+            `${mentions ? `${mentions}\n\n` : ""}I need some clarification before I can proceed:\n\n${clarificationQuestion}\n\nPlease reply mentioning \`@${cfg.botUsername}\` with your answer.`
+          );
+          setSession(id, branch, {
+            ...session,
+            status: "waiting_clarification",
+            pendingClarification: { question: clarificationQuestion, commentId },
+          });
+          appendHistory(id, branch, {
+            type: "clarification_requested",
+            pr: session.prNumber,
+            question: clarificationQuestion,
+            comment_id: commentId,
+          });
+          console.log(`[buffalo] Session for ${branch} waiting for clarification.`);
+          continue; // leave session in store, don't commit or post completion comment
+        }
+
+        // Use the commit message suggested by the agent if present, otherwise fall back.
+        const commitMsg =
+          extractCommitMessage(response) ?? `buffalo: address PR #${session.prNumber} feedback`;
+
+        // Commit and push any changes the CLI made.
+        const sha = commitAndPush(id, branch, commitMsg);
         if (sha) {
           appendHistory(id, branch, {
             type: "commit_pushed",
@@ -146,19 +219,70 @@ async function pollRepo(id: RepoId): Promise<void> {
             sha,
             message: `buffalo: address PR #${session.prNumber} feedback`,
           });
+        }
 
-          const commentId = await postComment(
-            id,
-            session.prNumber,
-            `Done! Pushed commit \`${sha}\` to address the feedback.`
-          );
+        // Build the comment. Format:
+        //   > @user: original comment (quoted)
+        //
+        //   @user Pushed commit `sha`. (or just @user if no commit)
+        //   #### Tokens used: N
+        //   #### Codex's response:
+        //   <response text>
+        const triggers = session.triggerComments ?? [];
+        const botTag = `@${cfg.botUsername}`;
 
+        const quoteLines = triggers.flatMap((c) => {
+          const body = c.body.replace(new RegExp(botTag, "gi"), "").trim();
+          return body.split("\n").map((l) => `> ${l}`);
+        });
+
+        const mentions = [...new Set(triggers.map((c) => `@${c.user}`))].join(" ");
+
+        const parts: string[] = [];
+        if (quoteLines.length > 0) {
+          parts.push(quoteLines.join("\n"));
+          parts.push("");
+        }
+
+        const opener = sha
+          ? `${mentions} Pushed commit \`${sha}\`.`.trim()
+          : mentions;
+        if (opener) parts.push(opener);
+
+        if (tokensUsed != null) {
+          parts.push("");
+          parts.push(`#### Tokens used: ${tokensUsed.toLocaleString()}`);
+        }
+
+        if (response) {
+          parts.push("");
+          const backendName = cfg.backend === "claude" ? "Claude" : "Codex";
+          parts.push(`## ${backendName}'s response:`);
+          parts.push("");
+          parts.push(response);
+        }
+
+        const commentBody = parts.join("\n").trim() || null;
+
+        if (commentBody) {
+          const commentId = await postComment(id, session.prNumber, commentBody);
           appendHistory(id, branch, {
             type: "comment_posted",
             pr: session.prNumber,
             comment_id: commentId,
           });
+          // Session produced output — keep codex context alive for follow-ups.
+          markBranchResumable(id, branch);
+        } else {
+          // No output at all — session likely failed or codex never ran. Clear
+          // resume state so the next attempt starts fresh, and un-see comment IDs
+          // so they'll be retried on the next poll.
+          clearBranchResumable(id, branch);
+          console.log(`[buffalo] Session for ${branch} produced no response — marking comments for retry.`);
+          for (const commentId of session.commentIds) seenIds.delete(commentId);
         }
+
+        removeSession(id, branch);
       }
     }
 
@@ -175,11 +299,12 @@ async function pollRepo(id: RepoId): Promise<void> {
         await checkAndCleanupMergedPR(id, prNum, branch);
       }
     }
+
+    saveSeenCommentIds(id, seenIds);
   } catch (err) {
     console.error(`[buffalo] Error polling ${id.owner}/${id.repo}:`, err);
+    throw err;
   }
-
-  saveLastPoll(id, now);
 }
 
 /**
@@ -198,7 +323,13 @@ export function startPolling(repos?: RepoId[]): void {
   const poll = async () => {
     if (!running) return;
     for (const id of targets) {
-      await pollRepo(id);
+      try {
+        await pollRepo(id);
+      } catch (err) {
+        console.error(`[buffalo] Fatal error — stopping poller.`);
+        stopPolling();
+        return;
+      }
     }
     if (running) {
       const interval = targets[0]

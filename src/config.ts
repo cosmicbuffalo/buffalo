@@ -55,8 +55,34 @@ export function logFile(id: RepoId, branch: string): string {
   return path.join(logDir(id), `${branch}.log`);
 }
 
+export function lastMessageFile(id: RepoId, branch: string): string {
+  return path.join(logDir(id), `${branch}-last-message.txt`);
+}
+
 export function historyFile(id: RepoId, branch: string): string {
   return path.join(historyDir(id), `${branch}.jsonl`);
+}
+
+export function buffaloTmuxConf(): string {
+  return path.join(getBuffaloDir(), "tmux.conf");
+}
+
+const BUFFALO_TMUX_CONF_CONTENT = `\
+# Buffalo tmux config — stock defaults, isolated from your personal tmux config.
+# This file is loaded instead of ~/.tmux.conf for buffalo's dedicated tmux server.
+
+# Keep the default prefix (C-b)
+set -g prefix C-b
+bind C-b send-prefix
+`;
+
+export function ensureBuffaloTmuxConf(): string {
+  const confPath = buffaloTmuxConf();
+  if (!fs.existsSync(confPath)) {
+    ensureDir(getBuffaloDir());
+    fs.writeFileSync(confPath, BUFFALO_TMUX_CONF_CONTENT, "utf-8");
+  }
+  return confPath;
 }
 
 export function ensureDir(dir: string): void {

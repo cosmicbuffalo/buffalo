@@ -13,8 +13,8 @@ import {
   pidFile,
   repoDir,
 } from "./config.js";
-import { attachToWindow, listWindows } from "./tmux-manager.js";
-import { pauseSession, resumeSession, loadSessions } from "./session-store.js";
+import { attachToTarget, attachToWindow, listWindows, destroySession } from "./tmux-manager.js";
+import { pauseSession, resumeSession, loadSessions, clearBranchResumable } from "./session-store.js";
 import { readHistory } from "./history.js";
 import { startPolling, stopPolling } from "./poller.js";
 import { runInit } from "./init.js";
@@ -142,8 +142,15 @@ export async function dispatch(args: string[]): Promise<void> {
         if (!id) { console.error("Internal error: no repo for foreground mode"); process.exit(1); }
         writePidFile(id, process.pid);
         startPolling([id]);
-        process.on("SIGINT", () => { stopPolling(); removePidFile(id); process.exit(0); });
-        process.on("SIGTERM", () => { stopPolling(); removePidFile(id); process.exit(0); });
+        const cleanExit = () => {
+          stopPolling();
+          // Only remove the PID file if it still contains our own PID.
+          // A restart may have already replaced it with the new daemon's PID.
+          if (readPidFile(id) === process.pid) removePidFile(id);
+          process.exit(0);
+        };
+        process.on("SIGINT", cleanExit);
+        process.on("SIGTERM", cleanExit);
         break;
       }
 
@@ -151,24 +158,52 @@ export async function dispatch(args: string[]): Promise<void> {
       for (const id of repos) {
         const existingPid = readPidFile(id);
         if (existingPid && isProcessRunning(existingPid)) {
-          console.log(`${id.owner}/${id.repo}: already running (pid ${existingPid})`);
+          console.log(`${id.owner}/${id.repo}: already running (pid ${existingPid}) — use 'buffalo restart' to replace`);
           continue;
+        } else if (existingPid) {
+          removePidFile(id); // Stale PID file — process is gone
         }
 
         // Spawn a detached background process for this repo
         const logPath = path.join(repoDir(id), "logs", "daemon.log");
         const out = fs.openSync(logPath, "a");
-        // Re-invoke the same entry point with --_foreground flag
         const child = spawn(
           process.argv[0],
           [process.argv[1], "start", "--_foreground", `${id.owner}/${id.repo}`],
-          {
-            detached: true,
-            stdio: ["ignore", out, out],
-          }
+          { detached: true, stdio: ["ignore", out, out] }
         );
         child.unref();
         console.log(`${id.owner}/${id.repo}: started in background (pid ${child.pid})`);
+      }
+      break;
+    }
+
+    case "restart": {
+      const repos = resolveTargetRepos(rest);
+      for (const id of repos) {
+        const existingPid = readPidFile(id);
+        if (existingPid && isProcessRunning(existingPid)) {
+          try {
+            process.kill(existingPid, "SIGTERM");
+            removePidFile(id);
+            console.log(`${id.owner}/${id.repo}: stopped old daemon (pid ${existingPid})`);
+          } catch {
+            console.warn(`${id.owner}/${id.repo}: could not stop pid ${existingPid}, continuing`);
+          }
+        } else if (existingPid) {
+          removePidFile(id);
+        }
+        destroySession(id);
+
+        const logPath = path.join(repoDir(id), "logs", "daemon.log");
+        const out = fs.openSync(logPath, "a");
+        const child = spawn(
+          process.argv[0],
+          [process.argv[1], "start", "--_foreground", `${id.owner}/${id.repo}`],
+          { detached: true, stdio: ["ignore", out, out] }
+        );
+        child.unref();
+        console.log(`${id.owner}/${id.repo}: restarted in background (pid ${child.pid})`);
       }
       break;
     }
@@ -180,15 +215,17 @@ export async function dispatch(args: string[]): Promise<void> {
         if (!pid || !isProcessRunning(pid)) {
           removePidFile(id);
           console.log(`${id.owner}/${id.repo}: not running`);
-          continue;
+        } else {
+          try {
+            process.kill(pid, "SIGTERM");
+            removePidFile(id);
+            console.log(`${id.owner}/${id.repo}: stopped (pid ${pid})`);
+          } catch (err) {
+            console.error(`${id.owner}/${id.repo}: failed to stop (pid ${pid}):`, err);
+          }
         }
-        try {
-          process.kill(pid, "SIGTERM");
-          removePidFile(id);
-          console.log(`${id.owner}/${id.repo}: stopped (pid ${pid})`);
-        } catch (err) {
-          console.error(`${id.owner}/${id.repo}: failed to stop (pid ${pid}):`, err);
-        }
+        destroySession(id);
+        console.log(`${id.owner}/${id.repo}: tmux session killed`);
       }
       break;
     }
@@ -217,16 +254,56 @@ export async function dispatch(args: string[]): Promise<void> {
     }
 
     case "attach": {
-      const id = rest.includes("--repo")
-        ? (() => {
-            const idx = rest.indexOf("--repo");
-            const [owner, repo] = rest[idx + 1].split("/");
-            return { owner, repo };
-          })()
-        : requireRepo();
+      const branchArg = rest.find((a) => !a.startsWith("-"));
 
-      const branch = rest.find((a) => !a.startsWith("-")) ?? getCurrentBranch();
-      attachToWindow(id, branch ?? undefined);
+      // Discover sessions directly from the buffalo tmux socket — no filesystem
+      // guessing needed. listWindows() already filters to buffalo- sessions.
+      const allWindows = listWindows();
+
+      if (allWindows.length === 0) {
+        console.error("[buffalo] No active sessions. Run 'buffalo start' first.");
+        break;
+      }
+
+      // Filter by branch if one was specified
+      const candidates = branchArg
+        ? allWindows.filter((w) => w.window === branchArg)
+        : allWindows;
+
+      if (candidates.length === 0) {
+        console.error(`[buffalo] No session found for branch '${branchArg}'.`);
+        console.log("Active sessions:");
+        for (const w of allWindows) console.log(`  ${w.session}:${w.window}`);
+        break;
+      }
+
+      let chosen = candidates[0];
+
+      if (candidates.length > 1) {
+        // Multiple sessions — prompt the user to pick one
+        console.log("Multiple active sessions:");
+        candidates.forEach((w, i) =>
+          console.log(`  ${i + 1}) ${w.session}:${w.window}${w.active ? " (active)" : ""}`)
+        );
+        const rl = (await import("node:readline")).createInterface({
+          input: process.stdin,
+          output: process.stdout,
+        });
+        const answer = await new Promise<string>((resolve) => {
+          rl.question(`Attach to which? (1-${candidates.length}): `, (a) => {
+            rl.close();
+            resolve(a.trim());
+          });
+        });
+        const idx = parseInt(answer, 10) - 1;
+        if (isNaN(idx) || idx < 0 || idx >= candidates.length) {
+          console.error("Invalid selection.");
+          break;
+        }
+        chosen = candidates[idx];
+      }
+
+      await attachToTarget(`${chosen.session}:${chosen.window}`);
       break;
     }
 
@@ -251,6 +328,15 @@ export async function dispatch(args: string[]): Promise<void> {
       } else {
         console.log(`No paused session for ${branch}`);
       }
+      break;
+    }
+
+    case "fresh": {
+      const id = requireRepo();
+      const branch = rest[0] ?? getCurrentBranch();
+      if (!branch) { console.error("No branch specified"); break; }
+      clearBranchResumable(id, branch);
+      console.log(`${branch}: next session will start fresh (codex context cleared)`);
       break;
     }
 
@@ -338,11 +424,13 @@ export async function dispatch(args: string[]): Promise<void> {
 Usage:
   buffalo init                        Set up a repo
   buffalo start [owner/repo]          Start polling in background
+  buffalo restart [owner/repo]        Stop existing daemon and start fresh
   buffalo stop [owner/repo]           Stop polling
   buffalo status                      Show repos and sessions
   buffalo attach [branch]             Attach to tmux window
   buffalo pause [branch]              Pause a session
   buffalo resume [branch]             Resume a session
+  buffalo fresh [branch]              Clear codex context — next session starts fresh
   buffalo list                        List active tmux windows
   buffalo logs [branch]               Tail log for a branch
   buffalo history [branch]            Show action history

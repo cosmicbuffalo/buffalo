@@ -1,15 +1,24 @@
+import * as os from "node:os";
+import * as path from "node:path";
 import { execSync, type ExecSyncOptions } from "node:child_process";
-import { type RepoId, logFile, ensureDir, logDir } from "./config.js";
+import { type RepoId, logFile, ensureDir, logDir, ensureBuffaloTmuxConf } from "./config.js";
 
 const EXEC_OPTS: ExecSyncOptions = { stdio: ["pipe", "pipe", "pipe"], encoding: "utf-8" };
+
+// All buffalo tmux operations use a dedicated socket so they are isolated from
+// the user's personal tmux server and work regardless of socket configuration.
+// -f points tmux at our own minimal config instead of the user's ~/.tmux.conf.
+const BUFFALO_SOCKET = ["-L", "buffalo", "-f", path.join(os.homedir(), ".buffalo", "tmux.conf")] as const;
 
 function sessionName(id: RepoId): string {
   return `buffalo-${id.owner}-${id.repo}`;
 }
 
 function run(cmd: string): string {
+  // Inject -L buffalo after "tmux" to use the dedicated socket
+  const final = cmd.replace(/^tmux /, `tmux ${BUFFALO_SOCKET.join(" ")} `);
   try {
-    return (execSync(cmd, EXEC_OPTS) as string).trim();
+    return (execSync(final, EXEC_OPTS) as string).trim();
   } catch {
     return "";
   }
@@ -21,6 +30,7 @@ function sessionExists(id: RepoId): boolean {
 
 export function ensureSession(id: RepoId): void {
   if (!sessionExists(id)) {
+    ensureBuffaloTmuxConf(); // writes ~/.buffalo/tmux.conf if missing before server starts
     run(`tmux new-session -d -s ${sessionName(id)} -x 200 -y 50`);
   }
 }
@@ -56,15 +66,23 @@ export function destroyWindow(id: RepoId, branch: string): void {
   run(`tmux kill-window -t ${sessionName(id)}:${branch} 2>/dev/null`);
 }
 
-export async function attachToWindow(id: RepoId, branch?: string): Promise<void> {
-  const target = branch
-    ? `${sessionName(id)}:${branch}`
-    : sessionName(id);
-  // This replaces current process — exec instead of execSync for attach
+export async function attachToTarget(target: string): Promise<void> {
   const { execFileSync } = await import("node:child_process");
+  // Unset TMUX so tmux doesn't refuse to nest. Using a dedicated socket
+  // (-L buffalo) means we're always talking to buffalo's own tmux server,
+  // not the user's personal one — no socket confusion across environments.
+  const { TMUX: _, ...env } = process.env;
+  console.log(`[buffalo] Attaching to tmux target: ${target}`);
   try {
-    execFileSync("tmux", ["attach-session", "-t", target], { stdio: "inherit" });
-  } catch {}
+    execFileSync("tmux", [...BUFFALO_SOCKET, "attach-session", "-t", target], { stdio: "inherit", env });
+  } catch (err: any) {
+    console.error(`[buffalo] Failed to attach: ${err.message}`);
+  }
+}
+
+export async function attachToWindow(id: RepoId, branch?: string): Promise<void> {
+  const target = branch ? `${sessionName(id)}:${branch}` : sessionName(id);
+  await attachToTarget(target);
 }
 
 export interface WindowInfo {
