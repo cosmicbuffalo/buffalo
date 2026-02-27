@@ -5,6 +5,8 @@ import { type RepoId, repoDir, ensureDir } from "./config.js";
 export interface TriggerComment {
   user: string;
   body: string;
+  commentId?: number;
+  commentType?: "issue" | "review";
 }
 
 export interface SessionInfo {

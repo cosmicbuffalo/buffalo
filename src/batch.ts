@@ -32,15 +32,37 @@ export function batchComments(
   return batches;
 }
 
-const FOOTER = [
-  "",
-  "Please address all the above requests. Make the necessary code changes.",
-  "Do NOT run `git add`, `git commit`, or `git push` — the bot will commit and push for you.",
-  "When finished, provide:",
-  "1. A brief summary of what you changed and why.",
-  "2. A suggested commit message on its own line starting with exactly `COMMIT: ` — e.g. `COMMIT: fix: correct the API timeout handling`",
-  "If you need clarification before you can proceed, output a single line starting with exactly `CLARIFICATION_NEEDED: ` followed by your question — e.g. `CLARIFICATION_NEEDED: Should the new function be async or sync?` — and do NOT include a COMMIT line. The bot will post your question to the PR and relay the human's answer back to you.",
-];
+const CLARIFICATION_INSTRUCTION =
+  "If you need clarification before you can proceed, output a single line starting with exactly " +
+  "`CLARIFICATION_NEEDED: ` followed by your question — e.g. `CLARIFICATION_NEEDED: Should the new function be async or sync?` " +
+  "— and do NOT include a COMMIT line. The bot will post your question to the PR and relay the human's answer back to you.";
+
+function buildFooter(reviewComments: PRComment[]): string[] {
+  const lines: string[] = [
+    "",
+    "Please address all the above requests. Make the necessary code changes.",
+    "Do NOT run `git add`, `git commit`, or `git push` — the bot will commit and push for you.",
+    "When finished, provide:",
+  ];
+
+  if (reviewComments.length > 0) {
+    lines.push(
+      "- A single-line response for each inline comment using this exact format:",
+    );
+    for (const c of reviewComments) {
+      lines.push(`  RESPONSE[${c.id}]: <your one-line response to comment #${c.id}>`);
+    }
+  } else {
+    lines.push("- A brief summary of what you changed and why.");
+  }
+
+  lines.push(
+    "- A suggested commit message on a line starting with exactly `COMMIT: ` — e.g. `COMMIT: fix: correct the API timeout handling`",
+    CLARIFICATION_INSTRUCTION,
+  );
+
+  return lines;
+}
 
 /**
  * Build a combined prompt from a batch of comments.
@@ -52,12 +74,26 @@ export function buildPrompt(batch: CommentBatch, botTag: string): string {
     "",
   ];
 
+  const reviewComments: PRComment[] = [];
+
   for (const c of batch.comments) {
     const body = c.body.replace(botTag, "").trim();
-    lines.push(`- @${c.user}: ${body}`);
+    if (c.commentType === "review" && c.path) {
+      reviewComments.push(c);
+      const loc = c.line != null ? ` line ${c.line}` : "";
+      lines.push(`- Comment #${c.id} by @${c.user} (on \`${c.path}\`${loc}): ${body}`);
+      if (c.diffHunk) {
+        lines.push(`  Code context:`);
+        lines.push("  ```diff");
+        for (const l of c.diffHunk.split("\n")) lines.push(`  ${l}`);
+        lines.push("  ```");
+      }
+    } else {
+      lines.push(`- @${c.user}: ${body}`);
+    }
   }
 
-  lines.push(...FOOTER);
+  lines.push(...buildFooter(reviewComments));
   return lines.join("\n");
 }
 
@@ -80,9 +116,17 @@ export function buildClarificationFollowUp(
     "",
   ];
 
+  const reviewComments: PRComment[] = [];
+
   for (const c of session.triggerComments ?? []) {
     const body = c.body.replace(new RegExp(botTag, "gi"), "").trim();
-    lines.push(`- @${c.user}: ${body}`);
+    if (c.commentType === "review" && c.commentId) {
+      // Reconstruct a minimal PRComment-like entry for the footer
+      reviewComments.push({ id: c.commentId, commentType: "review" } as PRComment);
+      lines.push(`- Comment #${c.commentId} by @${c.user}: ${body}`);
+    } else {
+      lines.push(`- @${c.user}: ${body}`);
+    }
   }
 
   lines.push(
@@ -94,7 +138,7 @@ export function buildClarificationFollowUp(
     answer,
   );
 
-  lines.push(...FOOTER);
+  lines.push(...buildFooter(reviewComments));
   return lines.join("\n");
 }
 
@@ -102,15 +146,21 @@ export function buildClarificationFollowUp(
 const LIST_PREFIX = /^(?:\d+\.\s*)?/;
 
 /**
- * Strip bot-directive lines (COMMIT: / CLARIFICATION_NEEDED:) from a response
- * before posting it to GitHub — they're internal signals, not human-readable output.
- * If removing directives leaves only a single numbered bullet, its "1. " prefix is
+ * Strip bot-directive lines and RESPONSE[id] blocks from a response before
+ * posting to GitHub — they're internal signals, not human-readable output.
+ * If removing directives leaves only a single numbered bullet, its prefix is
  * also stripped (a one-item list isn't a list).
  */
 export function stripDirectives(response: string | null): string | null {
   if (!response) return null;
-  const directivePat = new RegExp(`${LIST_PREFIX.source}(?:COMMIT|CLARIFICATION_NEEDED):\\s*`, "i");
   const bulletPat = /^\d+\.\s+/;
+
+  // RESPONSE[id]: blocks are single-line directives (we instruct the agent to keep them one line).
+  // COMMIT: and CLARIFICATION_NEEDED: are also single-line. Strip all of them.
+  const directivePat = new RegExp(
+    `${LIST_PREFIX.source}(?:COMMIT|CLARIFICATION_NEEDED|RESPONSE\\[\\d+\\]):\\s*`,
+    "i"
+  );
 
   const filtered = response.split("\n").filter((line) => !directivePat.test(line));
 
@@ -120,6 +170,24 @@ export function stripDirectives(response: string | null): string | null {
     : filtered;
 
   return lines.join("\n").trim() || null;
+}
+
+/**
+ * Extract per-comment responses from a structured agent response.
+ * Looks for lines like "RESPONSE[42]: text" (with optional list prefix).
+ * Returns a map of comment ID → response text, or null if none found.
+ */
+export function extractPerCommentResponses(response: string | null): Map<number, string> | null {
+  if (!response) return null;
+  const result = new Map<number, string>();
+  const pattern = new RegExp(`${LIST_PREFIX.source}RESPONSE\\[(\\d+)\\]:\\s*(.+)$`, "gim");
+  let match;
+  while ((match = pattern.exec(response)) !== null) {
+    const id = parseInt(match[1], 10);
+    const text = match[2].trim();
+    if (!isNaN(id) && text) result.set(id, text);
+  }
+  return result.size > 0 ? result : null;
 }
 
 /**

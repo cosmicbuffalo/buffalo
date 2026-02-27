@@ -11,6 +11,7 @@ function makeComment(overrides: Partial<PRComment> = {}): PRComment {
     prNumber: 10,
     createdAt: "2026-01-01T00:00:00Z",
     htmlUrl: "https://github.com/owner/repo/pull/10#issuecomment-1",
+    commentType: "issue",
     ...overrides,
   };
 }

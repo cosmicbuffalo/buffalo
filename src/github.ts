@@ -29,6 +29,11 @@ export interface PRComment {
   prNumber: number;
   createdAt: string;
   htmlUrl: string;
+  commentType: "issue" | "review";
+  // Review comment fields (only present for inline code comments)
+  path?: string;
+  diffHunk?: string;
+  line?: number;
 }
 
 export interface PullRequest {
@@ -65,6 +70,7 @@ export async function fetchPRComments(
       prNumber,
       createdAt: c.created_at,
       htmlUrl: c.html_url ?? "",
+      commentType: "issue",
     });
   }
 
@@ -77,6 +83,10 @@ export async function fetchPRComments(
       prNumber,
       createdAt: c.created_at,
       htmlUrl: c.html_url ?? "",
+      commentType: "review",
+      path: c.path,
+      diffHunk: c.diff_hunk,
+      line: c.line ?? c.original_line,
     });
   }
 
@@ -112,6 +122,25 @@ export async function getPullRequest(
 }
 
 /**
+ * Post a reply directly to an inline PR review comment.
+ * Uses the configured bot token so the reply appears from the bot account.
+ */
+export async function postReviewCommentReply(
+  id: RepoId,
+  prNumber: number,
+  replyToId: number,
+  body: string
+): Promise<number> {
+  const data = await ghJson<any>([
+    "api",
+    `repos/${id.owner}/${id.repo}/pulls/${prNumber}/comments/${replyToId}/replies`,
+    "--method", "POST",
+    "-f", `body=${body}`,
+  ], getBotToken(id));
+  return data.id;
+}
+
+/**
  * Post a comment on a PR. Uses the configured bot token so the comment
  * appears from the bot account.
  */
@@ -137,15 +166,14 @@ export async function postComment(
 export async function reactToComment(
   id: RepoId,
   commentId: number,
-  reaction: "+1" | "-1" | "laugh" | "confused" | "heart" | "hooray" | "rocket" | "eyes"
+  reaction: "+1" | "-1" | "laugh" | "confused" | "heart" | "hooray" | "rocket" | "eyes",
+  commentType: "issue" | "review" = "issue"
 ): Promise<void> {
+  const endpoint = commentType === "review"
+    ? `repos/${id.owner}/${id.repo}/pulls/comments/${commentId}/reactions`
+    : `repos/${id.owner}/${id.repo}/issues/comments/${commentId}/reactions`;
   try {
-    await ghRun([
-      "api",
-      `repos/${id.owner}/${id.repo}/issues/comments/${commentId}/reactions`,
-      "--method", "POST",
-      "-f", `content=${reaction}`,
-    ], getBotToken(id));
+    await ghRun(["api", endpoint, "--method", "POST", "-f", `content=${reaction}`], getBotToken(id));
   } catch (err: any) {
     console.warn(`[buffalo] Warning: could not react to comment ${commentId} (${err.message?.split("\n")[0]})`);
   }
