@@ -16,6 +16,8 @@ export interface SessionInfo {
   triggerComments?: TriggerComment[];
   status: "running" | "waiting_approval" | "waiting_clarification" | "completed" | "paused";
   logOffset: number;
+  issueNumber?: number;   // set when session originated from a GitHub issue
+  issueTitle?: string;    // title of the originating issue (for follow-up prompts)
   pendingApproval?: {
     command: string;
     failedPart: string;

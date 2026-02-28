@@ -22,6 +22,24 @@ function getBotToken(id: RepoId): string | undefined {
   return repoCfg.githubToken || loadGlobalConfig().githubToken || undefined;
 }
 
+export interface Issue {
+  number: number;
+  title: string;
+  body: string;
+  user: string;
+  state: string;
+  htmlUrl: string;
+}
+
+export interface IssueComment {
+  id: number;
+  body: string;
+  user: string;
+  issueNumber: number;
+  createdAt: string;
+  htmlUrl: string;
+}
+
 export interface PRComment {
   id: number;
   body: string;
@@ -176,6 +194,105 @@ export async function reactToComment(
     await ghRun(["api", endpoint, "--method", "POST", "-f", `content=${reaction}`], getBotToken(id));
   } catch (err: any) {
     console.warn(`[buffalo] Warning: could not react to comment ${commentId} (${err.message?.split("\n")[0]})`);
+  }
+}
+
+/**
+ * Get the default branch name for the repo.
+ */
+export async function getDefaultBranch(id: RepoId): Promise<string> {
+  const data = await ghJson<any>([
+    "api", `repos/${id.owner}/${id.repo}`,
+  ], getBotToken(id));
+  return data.default_branch ?? "main";
+}
+
+/**
+ * List open issues (not PRs) for the repo.
+ */
+export async function listOpenIssues(id: RepoId): Promise<Issue[]> {
+  const data = await ghJson<any[]>([
+    "issue", "list",
+    "--repo", `${id.owner}/${id.repo}`,
+    "--state", "open",
+    "--json", "number,title,body,author,url",
+    "--limit", "100",
+  ], getBotToken(id));
+
+  return data.map((issue) => ({
+    number: issue.number,
+    title: issue.title ?? "",
+    body: issue.body ?? "",
+    user: issue.author?.login ?? "",
+    state: "open",
+    htmlUrl: issue.url ?? "",
+  }));
+}
+
+/**
+ * Fetch comments on a specific issue that mention the bot.
+ */
+export async function fetchIssueComments(
+  id: RepoId,
+  issueNumber: number,
+  botTag: string
+): Promise<IssueComment[]> {
+  const data = await ghJson<any[]>([
+    "api",
+    `repos/${id.owner}/${id.repo}/issues/${issueNumber}/comments?per_page=100`,
+  ], getBotToken(id));
+
+  return data
+    .filter((c) => c.body?.includes(botTag))
+    .map((c) => ({
+      id: c.id,
+      body: c.body,
+      user: c.user?.login ?? "",
+      issueNumber,
+      createdAt: c.created_at,
+      htmlUrl: c.html_url ?? "",
+    }));
+}
+
+/**
+ * Create a pull request. Returns the PR number and URL.
+ */
+export async function createPullRequest(
+  id: RepoId,
+  branch: string,
+  base: string,
+  title: string,
+  body: string
+): Promise<{ number: number; url: string }> {
+  const data = await ghJson<any>([
+    "api",
+    `repos/${id.owner}/${id.repo}/pulls`,
+    "--method", "POST",
+    "-f", `head=${branch}`,
+    "-f", `base=${base}`,
+    "-f", `title=${title}`,
+    "-f", `body=${body}`,
+  ], getBotToken(id));
+  return { number: data.number, url: data.html_url };
+}
+
+/**
+ * React to an issue body (not a comment).
+ */
+export async function reactToIssue(
+  id: RepoId,
+  issueNumber: number,
+  reaction: "+1" | "-1" | "laugh" | "confused" | "heart" | "hooray" | "rocket" | "eyes"
+): Promise<void> {
+  try {
+    await ghRun([
+      "api",
+      `repos/${id.owner}/${id.repo}/issues/${issueNumber}/reactions`,
+      "--method", "POST",
+      "-f", `content=${reaction}`,
+    ], getBotToken(id));
+  } catch (err: any) {
+    console.warn(`[buffalo] Warning: could not react to issue ${issueNumber} (${err.message?.split("\n")[0]})`);
   }
 }
 

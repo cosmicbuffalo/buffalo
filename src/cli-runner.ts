@@ -202,7 +202,8 @@ export function startCliSession(
   branch: string,
   prompt: string,
   cwd: string,
-  prNumber: number
+  prNumber: number,
+  issueNumber?: number
 ): void {
   const cfg = loadRepoConfig(id);
 
@@ -224,6 +225,7 @@ export function startCliSession(
   appendHistory(id, branch, {
     type: "cli_started",
     pr: prNumber,
+    ...(issueNumber !== undefined ? { issue: issueNumber } : {}),
     command,
     tmux_window: branch,
   });

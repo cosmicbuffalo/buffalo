@@ -1,4 +1,4 @@
-import type { PRComment } from "./github.js";
+import type { PRComment, Issue, IssueComment } from "./github.js";
 import type { SessionInfo } from "./session-store.js";
 
 export interface CommentBatch {
@@ -156,9 +156,9 @@ export function stripDirectives(response: string | null): string | null {
   const bulletPat = /^\d+\.\s+/;
 
   // RESPONSE[id]: blocks are single-line directives (we instruct the agent to keep them one line).
-  // COMMIT: and CLARIFICATION_NEEDED: are also single-line. Strip all of them.
+  // COMMIT:, CLARIFICATION_NEEDED:, BRANCH_NAME:, PR_TITLE: are also single-line. Strip all of them.
   const directivePat = new RegExp(
-    `${LIST_PREFIX.source}(?:COMMIT|CLARIFICATION_NEEDED|RESPONSE\\[\\d+\\]):\\s*`,
+    `${LIST_PREFIX.source}(?:COMMIT|CLARIFICATION_NEEDED|BRANCH_NAME|PR_TITLE|RESPONSE\\[\\d+\\]):\\s*`,
     "i"
   );
 
@@ -208,4 +208,109 @@ export function extractClarification(response: string | null): string | null {
   if (!response) return null;
   const match = response.match(new RegExp(`${LIST_PREFIX.source}CLARIFICATION_NEEDED:\\s*(.+)$`, "im"));
   return match?.[1]?.trim() ?? null;
+}
+
+/**
+ * Extract a branch name from the agent's response.
+ * Handles lines like "BRANCH_NAME: fix/login-bug" or "2. BRANCH_NAME: ...".
+ */
+export function extractBranchName(response: string | null): string | null {
+  if (!response) return null;
+  const match = response.match(new RegExp(`${LIST_PREFIX.source}BRANCH_NAME:\\s*(.+)$`, "im"));
+  return match?.[1]?.trim() ?? null;
+}
+
+/**
+ * Extract a PR title from the agent's response.
+ * Handles lines like "PR_TITLE: Fix login session expiry" or "2. PR_TITLE: ...".
+ */
+export function extractPRTitle(response: string | null): string | null {
+  if (!response) return null;
+  const match = response.match(new RegExp(`${LIST_PREFIX.source}PR_TITLE:\\s*(.+)$`, "im"));
+  return match?.[1]?.trim() ?? null;
+}
+
+/**
+ * Build a prompt for a fresh issue session.
+ */
+export function buildIssuePrompt(issue: Issue, botTag: string): string {
+  // Extract owner/repo from the issue URL: https://github.com/owner/repo/issues/42
+  const urlMatch = issue.htmlUrl.match(/github\.com\/([^/]+\/[^/]+)\//);
+  const repoSlug = urlMatch ? urlMatch[1] : "the repository";
+
+  const lines: string[] = [
+    `You are working on issue #${issue.number} "${issue.title}" in repo ${repoSlug}.`,
+    "",
+    "Issue body:",
+    "---",
+    issue.body,
+    "---",
+    "",
+    "Analyze the issue. Either make code changes to resolve it, or respond with a comment.",
+    `Do NOT run \`git add\`, \`git commit\`, \`git push\`, or open PRs yourself — the bot will handle that.`,
+    "Do NOT push to or modify the default branch.",
+    "",
+    "When finished, provide:",
+    "- If you made code changes:",
+    "  BRANCH_NAME: <short kebab-case branch, e.g. fix/login-session-expiry>",
+    "  PR_TITLE: <concise PR title>",
+    "  COMMIT: <commit message>",
+    "  A description of what you changed (used as PR body).",
+    "- If answering without code changes: just provide your response.",
+    "CLARIFICATION_NEEDED: <question> (if you need clarification before proceeding)",
+  ];
+
+  return lines.join("\n");
+}
+
+/**
+ * Build a follow-up prompt for an issue session after a new comment arrives.
+ */
+export function buildIssueFollowUpPrompt(
+  session: SessionInfo,
+  newComments: IssueComment[],
+  botTag: string,
+  existingPr?: { prNumber: number; branch: string }
+): string {
+  const issueNumber = session.issueNumber ?? session.prNumber;
+  const title = session.issueTitle ? ` "${session.issueTitle}"` : "";
+
+  const lines: string[] = [
+    `You are working on issue #${issueNumber}${title}.`,
+  ];
+
+  if (existingPr) {
+    lines.push(
+      `This issue has an associated PR #${existingPr.prNumber} on branch "${existingPr.branch}".`
+    );
+  }
+
+  lines.push("", "A follow-up comment was posted:", "");
+
+  for (const c of newComments) {
+    const body = c.body.replace(new RegExp(botTag, "gi"), "").trim();
+    lines.push(`- @${c.user}: ${body}`);
+  }
+
+  if (session.triggerComments && session.triggerComments.length > 0) {
+    lines.push("", "Original issue context:", "");
+    for (const c of session.triggerComments) {
+      const body = c.body.replace(new RegExp(botTag, "gi"), "").trim();
+      lines.push(`- @${c.user}: ${body}`);
+    }
+  }
+
+  lines.push(
+    "",
+    existingPr
+      ? `Make any necessary code changes to the existing branch "${existingPr.branch}".`
+      : "Make any necessary code changes.",
+    `Do NOT run \`git add\`, \`git commit\`, \`git push\`, or open PRs yourself — the bot will handle that.`,
+    "When finished, provide:",
+    "- COMMIT: <commit message> (omit this line if no code changes were made)",
+    "- A response to post as a comment on the issue.",
+    "CLARIFICATION_NEEDED: <question> (if you need clarification before proceeding)",
+  );
+
+  return lines.join("\n");
 }

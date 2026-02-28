@@ -1,5 +1,6 @@
 import { execSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { type RepoId, workspaceDir, ensureDir } from "./config.js";
 import { appendHistory } from "./history.js";
 import { destroyWindow } from "./tmux-manager.js";
@@ -64,10 +65,59 @@ export function commitAndPush(
   run("git add -A", dir);
   const escaped = message.replace(/"/g, '\\"');
   run(`git commit -m "${escaped}"`, dir);
-  run("git push", dir);
+  run(`git push --set-upstream origin ${branch}`, dir);
 
   const sha = run("git rev-parse --short HEAD", dir);
   return sha;
+}
+
+/**
+ * Clone the default branch into a fresh workspace for an issue session.
+ * Does NOT create a local branch — codex works against uncommitted changes only.
+ */
+export function createIssueBranch(
+  id: RepoId,
+  tempBranch: string,
+  defaultBranch: string,
+  cloneUrl: string
+): string {
+  const dir = workspaceDir(id, tempBranch);
+
+  if (fs.existsSync(dir) && fs.existsSync(`${dir}/.git`)) {
+    // Already exists — refresh to latest default branch state
+    run("git fetch origin", dir);
+    run(`git reset --hard origin/${defaultBranch}`, dir);
+    return dir;
+  }
+
+  ensureDir(dir);
+
+  const sshUrl = cloneUrl.replace(/^https:\/\/([^/]+)\//, "git@$1:");
+  run(
+    `git clone --depth=1 --single-branch --branch ${defaultBranch} ${sshUrl} ${dir}`
+  );
+
+  return dir;
+}
+
+/**
+ * Create a new local git branch in a workspace (from the current working-tree state).
+ */
+export function checkoutNewBranch(id: RepoId, currentBranch: string, newBranch: string): void {
+  const dir = workspaceDir(id, currentBranch);
+  run(`git checkout -b ${newBranch}`, dir);
+}
+
+/**
+ * Rename a workspace directory. No git operations — only filesystem rename.
+ * The git branch must already have been created (via checkoutNewBranch) before calling this.
+ */
+export function renameWorkspaceDir(id: RepoId, oldBranch: string, newBranch: string): string {
+  const oldDir = workspaceDir(id, oldBranch);
+  const newDir = workspaceDir(id, newBranch);
+  ensureDir(path.dirname(newDir));
+  fs.renameSync(oldDir, newDir);
+  return newDir;
 }
 
 /**

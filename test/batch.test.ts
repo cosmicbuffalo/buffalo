@@ -4,12 +4,16 @@ import {
   batchComments,
   buildPrompt,
   buildClarificationFollowUp,
+  buildIssuePrompt,
+  buildIssueFollowUpPrompt,
   extractCommitMessage,
   extractClarification,
+  extractBranchName,
+  extractPRTitle,
   extractPerCommentResponses,
   stripDirectives,
 } from "../src/batch.js";
-import type { PRComment } from "../src/github.js";
+import type { PRComment, Issue, IssueComment } from "../src/github.js";
 import type { SessionInfo } from "../src/session-store.js";
 
 function makeComment(overrides: Partial<PRComment> = {}): PRComment {
@@ -272,6 +276,203 @@ describe("batch", () => {
 
     it("returns null for null input", () => {
       assert.equal(extractPerCommentResponses(null), null);
+    });
+  });
+
+  describe("extractBranchName", () => {
+    it("extracts a BRANCH_NAME: line", () => {
+      const response = "Made changes.\nBRANCH_NAME: fix/login-session-expiry\nCOMMIT: fix: expire sessions";
+      assert.equal(extractBranchName(response), "fix/login-session-expiry");
+    });
+
+    it("extracts BRANCH_NAME: with a numbered list prefix", () => {
+      const response = "1. Summary\n2. BRANCH_NAME: feat/new-feature";
+      assert.equal(extractBranchName(response), "feat/new-feature");
+    });
+
+    it("returns null when no BRANCH_NAME line present", () => {
+      assert.equal(extractBranchName("COMMIT: fix something"), null);
+    });
+
+    it("returns null for null input", () => {
+      assert.equal(extractBranchName(null), null);
+    });
+  });
+
+  describe("extractPRTitle", () => {
+    it("extracts a PR_TITLE: line", () => {
+      const response = "PR_TITLE: Fix login session expiry\nCOMMIT: fix: expire sessions";
+      assert.equal(extractPRTitle(response), "Fix login session expiry");
+    });
+
+    it("extracts PR_TITLE: with a numbered list prefix", () => {
+      const response = "1. PR_TITLE: Add retry logic";
+      assert.equal(extractPRTitle(response), "Add retry logic");
+    });
+
+    it("returns null when no PR_TITLE line present", () => {
+      assert.equal(extractPRTitle("COMMIT: fix something"), null);
+    });
+
+    it("returns null for null input", () => {
+      assert.equal(extractPRTitle(null), null);
+    });
+  });
+
+  describe("buildIssuePrompt", () => {
+    function makeIssue(overrides: Partial<Issue> = {}): Issue {
+      return {
+        number: 42,
+        title: "Login session expires too quickly",
+        body: "Users report that sessions expire after 5 minutes.",
+        user: "alice",
+        state: "open",
+        htmlUrl: "https://github.com/owner/repo/issues/42",
+        ...overrides,
+      };
+    }
+
+    it("includes the issue number and title", () => {
+      const prompt = buildIssuePrompt(makeIssue(), "@bot");
+      assert.ok(prompt.includes("issue #42"));
+      assert.ok(prompt.includes("Login session expires too quickly"));
+    });
+
+    it("includes the issue body", () => {
+      const prompt = buildIssuePrompt(makeIssue(), "@bot");
+      assert.ok(prompt.includes("Users report that sessions expire after 5 minutes."));
+    });
+
+    it("includes the repo slug extracted from the URL", () => {
+      const prompt = buildIssuePrompt(makeIssue(), "@bot");
+      assert.ok(prompt.includes("owner/repo"));
+    });
+
+    it("includes BRANCH_NAME and PR_TITLE directives in the instructions", () => {
+      const prompt = buildIssuePrompt(makeIssue(), "@bot");
+      assert.ok(prompt.includes("BRANCH_NAME:"));
+      assert.ok(prompt.includes("PR_TITLE:"));
+    });
+
+    it("includes COMMIT and CLARIFICATION_NEEDED directives", () => {
+      const prompt = buildIssuePrompt(makeIssue(), "@bot");
+      assert.ok(prompt.includes("COMMIT:"));
+      assert.ok(prompt.includes("CLARIFICATION_NEEDED:"));
+    });
+
+    it("instructs not to push or commit directly", () => {
+      const prompt = buildIssuePrompt(makeIssue(), "@bot");
+      assert.ok(prompt.includes("bot will handle that") || prompt.includes("do NOT"));
+    });
+
+    it("handles missing htmlUrl gracefully", () => {
+      const prompt = buildIssuePrompt(makeIssue({ htmlUrl: "" }), "@bot");
+      assert.ok(prompt.includes("issue #42"));
+    });
+  });
+
+  describe("buildIssueFollowUpPrompt", () => {
+    function makeIssueComment(overrides: Partial<IssueComment> = {}): IssueComment {
+      return {
+        id: 500,
+        body: "@bot can you also fix the timeout?",
+        user: "bob",
+        issueNumber: 42,
+        createdAt: "2026-01-02T00:00:00Z",
+        htmlUrl: "https://github.com/owner/repo/issues/42#issuecomment-500",
+        ...overrides,
+      };
+    }
+
+    const baseSession: SessionInfo = {
+      branch: "buffalo/issue-42",
+      prNumber: 42,
+      commentIds: [],
+      status: "running",
+      logOffset: 0,
+      issueNumber: 42,
+      issueTitle: "Login session expires too quickly",
+      triggerComments: [
+        { user: "alice", body: "@bot sessions expire too fast" },
+      ],
+    };
+
+    it("includes the issue number", () => {
+      const prompt = buildIssueFollowUpPrompt(baseSession, [makeIssueComment()], "@bot");
+      assert.ok(prompt.includes("issue #42"));
+    });
+
+    it("includes the follow-up comment author and body", () => {
+      const prompt = buildIssueFollowUpPrompt(baseSession, [makeIssueComment()], "@bot");
+      assert.ok(prompt.includes("@bob"));
+      assert.ok(prompt.includes("can you also fix the timeout?"));
+    });
+
+    it("strips the bot tag from follow-up comment", () => {
+      const prompt = buildIssueFollowUpPrompt(
+        baseSession,
+        [makeIssueComment({ body: "@bot please fix this" })],
+        "@bot"
+      );
+      assert.ok(prompt.includes("please fix this"));
+      assert.ok(!prompt.includes("@bot"));
+    });
+
+    it("repeats the original trigger context", () => {
+      const prompt = buildIssueFollowUpPrompt(baseSession, [makeIssueComment()], "@bot");
+      assert.ok(prompt.includes("sessions expire too fast"));
+    });
+
+    it("mentions the existing PR when one exists", () => {
+      const prompt = buildIssueFollowUpPrompt(
+        baseSession,
+        [makeIssueComment()],
+        "@bot",
+        { prNumber: 15, branch: "fix/login-bug" }
+      );
+      assert.ok(prompt.includes("PR #15"));
+      assert.ok(prompt.includes("fix/login-bug"));
+    });
+
+    it("includes COMMIT directive in instructions", () => {
+      const prompt = buildIssueFollowUpPrompt(baseSession, [makeIssueComment()], "@bot");
+      assert.ok(prompt.includes("COMMIT:"));
+    });
+
+    it("includes the issue title when available", () => {
+      const prompt = buildIssueFollowUpPrompt(baseSession, [makeIssueComment()], "@bot");
+      assert.ok(prompt.includes("Login session expires too quickly"));
+    });
+
+    it("works without issueTitle in session", () => {
+      const sessionNoTitle: SessionInfo = { ...baseSession, issueTitle: undefined };
+      const prompt = buildIssueFollowUpPrompt(sessionNoTitle, [makeIssueComment()], "@bot");
+      assert.ok(prompt.includes("issue #42"));
+    });
+  });
+
+  describe("stripDirectives - BRANCH_NAME and PR_TITLE", () => {
+    it("removes BRANCH_NAME: lines", () => {
+      const input = "Made some changes.\nBRANCH_NAME: fix/my-branch\nCOMMIT: fix: the thing";
+      const result = stripDirectives(input);
+      assert.ok(!result?.includes("BRANCH_NAME:"));
+      assert.ok(result?.includes("Made some changes."));
+    });
+
+    it("removes PR_TITLE: lines", () => {
+      const input = "Fixed the bug.\nPR_TITLE: Fix the login bug\nCOMMIT: fix: login";
+      const result = stripDirectives(input);
+      assert.ok(!result?.includes("PR_TITLE:"));
+      assert.ok(result?.includes("Fixed the bug."));
+    });
+
+    it("removes both BRANCH_NAME and PR_TITLE in one pass", () => {
+      const input = "Description.\nBRANCH_NAME: fix/x\nPR_TITLE: Fix X\nCOMMIT: fix: x";
+      const result = stripDirectives(input);
+      assert.ok(!result?.includes("BRANCH_NAME:"));
+      assert.ok(!result?.includes("PR_TITLE:"));
+      assert.ok(!result?.includes("COMMIT:"));
+      assert.ok(result?.includes("Description."));
     });
   });
 
