@@ -1,11 +1,11 @@
 import { type RepoId, loadRepoConfig, getAllRepos, workspaceDir } from "./config.js";
-import { fetchPRComments, listOpenPRs, getPullRequest, postComment, postReviewCommentReply, reactToComment, listOpenIssues, fetchIssueComments, getDefaultBranch, createPullRequest, reactToIssue } from "./github.js";
+import { fetchPRComments, listOpenPRs, getPullRequest, postComment, postReviewCommentReply, reactToComment, listOpenIssues, fetchIssueComments, getDefaultBranch, createPullRequest, reactToIssue, deleteComment } from "./github.js";
 import { loadSeenCommentIds, saveSeenCommentIds, loadSessions, getSession, setSession, removeSession, markBranchResumable, clearBranchResumable } from "./session-store.js";
 import { loadSeenIssueIds, saveSeenIssueIds, loadSeenIssueCommentIds, saveSeenIssueCommentIds, getIssuePr, setIssuePr } from "./issue-store.js";
-import { ensureWorkspace, commitAndPush, checkAndCleanupMergedPR, createIssueBranch, checkoutNewBranch, renameWorkspaceDir } from "./repo-manager.js";
+import { ensureWorkspace, commitAndPush, checkAndCleanupMergedPR, createIssueBranch, checkoutNewBranch, renameWorkspaceDir, rollbackLastCommit } from "./repo-manager.js";
 import { startCliSession, monitorSession, handleApproval, readSessionOutput } from "./cli-runner.js";
 import { batchComments, buildPrompt, buildClarificationFollowUp, buildIssuePrompt, buildIssueFollowUpPrompt, extractCommitMessage, extractClarification, extractPerCommentResponses, extractBranchName, extractPRTitle, stripDirectives } from "./batch.js";
-import { appendHistory } from "./history.js";
+import { appendHistory, readHistory } from "./history.js";
 
 let running = false;
 let pollTimer: ReturnType<typeof setTimeout> | null = null;
@@ -30,6 +30,61 @@ function rewriteLocalPaths(text: string, id: RepoId, branch: string): string {
   result = result.replace(new RegExp(`${escaped}/`, "g"), "");
 
   return result;
+}
+
+function isUndoCommand(body: string, botUsername: string): boolean {
+  const lower = body.toLowerCase();
+  return lower.includes(`@${botUsername.toLowerCase()} undo`);
+}
+
+function isTryAgainCommand(body: string, botUsername: string): boolean {
+  const lower = body.toLowerCase();
+  const bot = `@${botUsername.toLowerCase()}`;
+  return lower.includes(`${bot} try again`) || lower.includes(`${bot} retry`);
+}
+
+function isControlComment(body: string, botUsername: string): boolean {
+  const lower = body.toLowerCase();
+  return (
+    lower.includes("allow once") ||
+    lower.includes("allow always") ||
+    lower.includes(`@${botUsername.toLowerCase()} deny`) ||
+    isUndoCommand(body, botUsername) ||
+    isTryAgainCommand(body, botUsername)
+  );
+}
+
+function extractTryAgainNote(body: string): string | null {
+  const match = body.match(/(?:try again|retry)[:\s-]*(.*)$/i);
+  const note = match?.[1]?.trim() ?? "";
+  return note.length > 0 ? note : null;
+}
+
+/**
+ * Find the comment ID of the last comment posted by the bot on a given branch/PR.
+ * Used by try-again and undo to delete the stale response before retrying.
+ */
+function findLastBotCommentId(id: RepoId, branch: string, prNumber: number): number | null {
+  const events = readHistory(id, branch).slice().reverse();
+  for (const e of events) {
+    if (e.type !== "comment_posted") continue;
+    if (e.pr !== prNumber) continue;
+    if (typeof e.comment_id === "number") return e.comment_id;
+  }
+  return null;
+}
+
+function findLastTaskRequest(id: RepoId, branch: string, prNumber: number, botUsername: string): string | null {
+  const events = readHistory(id, branch).slice().reverse();
+  for (const e of events) {
+    if (e.type !== "comment_detected") continue;
+    if (e.pr !== prNumber) continue;
+    const body = typeof e.body === "string" ? e.body : "";
+    if (!body) continue;
+    if (isControlComment(body, botUsername)) continue;
+    return body;
+  }
+  return null;
 }
 
 /**
@@ -114,6 +169,89 @@ async function pollIssues(
       console.log(`[buffalo] ${repoLabel}: issue #${issue.number} comment ${c.id} mentions ${botTag}`);
       await reactToComment(id, c.id, "eyes", "issue");
       seenIssueCommentIds.add(c.id);
+
+      // Handle "try again" specially: delete the bot's stale comment and restart.
+      if (isTryAgainCommand(c.body, cfg.botUsername)) {
+        try {
+          const tempBranch = `buffalo/issue-${issue.number}`;
+          const existingPr = getIssuePr(id, issue.number);
+          const note = extractTryAgainNote(c.body);
+
+          // Delete the bot's last comment on this issue so it doesn't linger.
+          const staleCommentId = findLastBotCommentId(
+            id,
+            existingPr ? existingPr.branch : tempBranch,
+            issue.number
+          );
+          if (staleCommentId) await deleteComment(id, staleCommentId);
+
+          if (existingPr) {
+            // Roll back the last commit on the PR branch and retry.
+            const cwd = ensureWorkspace(id, existingPr.branch, cloneUrl);
+            rollbackLastCommit(id, existingPr.branch);
+            const sessionToUse = {
+              branch: existingPr.branch,
+              prNumber: issue.number,
+              commentIds: [],
+              triggerComments: getSession(id, existingPr.branch)?.triggerComments ?? [],
+              status: "running" as const,
+              logOffset: 0,
+              issueNumber: issue.number,
+              issueTitle: issue.title,
+            };
+            const retryComment = { ...c, body: [
+              "Retry the previous request using a different approach.",
+              note ? `Additional guidance: ${note}` : null,
+            ].filter(Boolean).join("\n") };
+            const prompt = buildIssueFollowUpPrompt(sessionToUse, [retryComment], botTag, existingPr);
+            startCliSession(id, existingPr.branch, prompt, cwd, issue.number, issue.number);
+            setSession(id, existingPr.branch, { ...sessionToUse, commentIds: [c.id], status: "running", logOffset: 0 });
+          } else {
+            // No PR yet — restart the issue session from scratch.
+            const defaultBranch = await getDefaultBranch(id);
+            const cwd = createIssueBranch(id, tempBranch, defaultBranch, cloneUrl);
+            const existingSession = getSession(id, tempBranch);
+            const sessionToUse = existingSession ?? {
+              branch: tempBranch,
+              prNumber: issue.number,
+              commentIds: [],
+              triggerComments: [{ user: issue.user, body: issue.body ?? "" }],
+              status: "running" as const,
+              logOffset: 0,
+              issueNumber: issue.number,
+              issueTitle: issue.title,
+            };
+            const retryComment = { ...c, body: [
+              "Retry the previous request using a different approach.",
+              note ? `Additional guidance: ${note}` : null,
+            ].filter(Boolean).join("\n") };
+            const prompt = buildIssueFollowUpPrompt(sessionToUse, [retryComment], botTag);
+            startCliSession(id, tempBranch, prompt, cwd, issue.number, issue.number);
+            setSession(id, tempBranch, {
+              branch: tempBranch,
+              prNumber: issue.number,
+              commentIds: [c.id],
+              triggerComments: sessionToUse.triggerComments,
+              status: "running",
+              logOffset: 0,
+              issueNumber: issue.number,
+              issueTitle: issue.title,
+            });
+          }
+
+          appendHistory(id, existingPr ? existingPr.branch : tempBranch, {
+            type: "retry_started",
+            pr: issue.number,
+            trigger_comment_id: c.id,
+            by: c.user,
+            note: note ?? "",
+          });
+        } catch (err: any) {
+          console.error(`[buffalo] Failed to handle issue try-again for #${issue.number}:`, err);
+          seenIssueCommentIds.delete(c.id);
+        }
+        continue;
+      }
 
       try {
         const existingPr = getIssuePr(id, issue.number);
@@ -290,15 +428,114 @@ async function pollRepo(id: RepoId): Promise<void> {
         seenIds.add(c.id);
         continue;
       }
+      if (isUndoCommand(c.body, cfg.botUsername)) {
+        try {
+          const pr = await getPullRequest(id, c.prNumber);
+          const cwd = ensureWorkspace(id, pr.branch, pr.cloneUrl);
+          // cwd is intentionally computed first to guarantee branch workspace exists.
+          void cwd;
+          const newHead = rollbackLastCommit(id, pr.branch);
+          // Delete the bot's previous comment so the bad response doesn't linger.
+          const staleCommentId = findLastBotCommentId(id, pr.branch, c.prNumber);
+          if (staleCommentId) await deleteComment(id, staleCommentId);
+          await reactToComment(id, c.id, "+1", c.commentType);
+          await postComment(
+            id,
+            c.prNumber,
+            `@${c.user} Rolled back the latest Buffalo commit on \`${pr.branch}\` and force-pushed. New HEAD is \`${newHead}\`.`
+          );
+          appendHistory(id, pr.branch, {
+            type: "undo_applied",
+            pr: c.prNumber,
+            trigger_comment_id: c.id,
+            by: c.user,
+            head_after: newHead,
+          });
+        } catch (err: any) {
+          await postComment(
+            id,
+            c.prNumber,
+            `@${c.user} I couldn't roll back the last commit: ${err?.message ?? "unknown error"}`
+          );
+        }
+        seenIds.add(c.id);
+        continue;
+      }
+      if (isTryAgainCommand(c.body, cfg.botUsername)) {
+        try {
+          const pr = await getPullRequest(id, c.prNumber);
+          const cwd = ensureWorkspace(id, pr.branch, pr.cloneUrl);
+          const newHead = rollbackLastCommit(id, pr.branch);
+          // Delete the bot's previous comment so the bad response doesn't linger.
+          const staleCommentId = findLastBotCommentId(id, pr.branch, c.prNumber);
+          if (staleCommentId) await deleteComment(id, staleCommentId);
+          const original = findLastTaskRequest(id, pr.branch, c.prNumber, cfg.botUsername);
+          const note = extractTryAgainNote(c.body);
+          const originalBody = original
+            ? original.replace(new RegExp(`@${cfg.botUsername}`, "gi"), "").trim()
+            : "(original request not found in history)";
+          const retryBody = [
+            `@${cfg.botUsername} Retry the previous request using a different approach.`,
+            `Original request: ${originalBody}`,
+            note ? `Additional guidance: ${note}` : null,
+          ].filter(Boolean).join("\n");
+
+          const retryBatch = {
+            prNumber: c.prNumber,
+            branch: pr.branch,
+            comments: [{
+              ...c,
+              body: retryBody,
+            }],
+          };
+
+          startCliSession(id, pr.branch, buildPrompt(retryBatch, `@${cfg.botUsername}`), cwd, c.prNumber);
+          setSession(id, pr.branch, {
+            branch: pr.branch,
+            prNumber: c.prNumber,
+            commentIds: [c.id],
+            triggerComments: [{
+              user: c.user,
+              body: c.body,
+              commentId: c.id,
+              commentType: c.commentType,
+            }],
+            status: "running",
+            logOffset: 0,
+          });
+
+          await reactToComment(id, c.id, "+1", c.commentType);
+          await postComment(
+            id,
+            c.prNumber,
+            `@${c.user} Rolled back the previous attempt on \`${pr.branch}\` (new HEAD \`${newHead}\`) and started a retry with your guidance.`
+          );
+          appendHistory(id, pr.branch, {
+            type: "retry_started",
+            pr: c.prNumber,
+            trigger_comment_id: c.id,
+            by: c.user,
+            original_request: originalBody,
+            note: note ?? "",
+            head_after_undo: newHead,
+          });
+        } catch (err: any) {
+          await postComment(
+            id,
+            c.prNumber,
+            `@${c.user} I couldn't start a retry: ${err?.message ?? "unknown error"}`
+          );
+        }
+        seenIds.add(c.id);
+        continue;
+      }
     }
 
     // Filter out approval responses for batching — only new task comments
     const taskComments = authorized.filter((c) => {
       const lower = c.body.toLowerCase();
       return (
-        !lower.includes("allow once") &&
-        !lower.includes("allow always") &&
-        !lower.includes(`${`@${cfg.botUsername}`.toLowerCase()} deny`)
+        !isControlComment(c.body, cfg.botUsername)
       );
     });
 
@@ -505,8 +742,13 @@ async function handleIssueSessionCompletion(
         );
 
         setIssuePr(id, n, prNumber, finalBranchName);
-        await postComment(id, n, `I've opened a PR to address this: ${prUrl}`);
+        const prLinkCommentId = await postComment(id, n, `I've opened a PR to address this: ${prUrl}`);
 
+        appendHistory(id, branch, {
+          type: "comment_posted",
+          pr: n,
+          comment_id: prLinkCommentId,
+        });
         appendHistory(id, finalBranchName, {
           type: "pr_opened",
           pr: prNumber,
@@ -519,7 +761,8 @@ async function handleIssueSessionCompletion(
         // No changes detected — post the response as a comment
         const displayResponse = stripDirectives(response ? rewriteLocalPaths(response, id, finalBranchName) : null);
         if (displayResponse) {
-          await postComment(id, n, displayResponse);
+          const commentId = await postComment(id, n, displayResponse);
+          appendHistory(id, branch, { type: "comment_posted", pr: n, comment_id: commentId });
         }
       }
     } catch (err) {
@@ -539,7 +782,8 @@ async function handleIssueSessionCompletion(
       response ? rewriteLocalPaths(response, id, branch) : null
     );
     if (displayResponse) {
-      await postComment(id, n, displayResponse);
+      const commentId = await postComment(id, n, displayResponse);
+      appendHistory(id, branch, { type: "comment_posted", pr: n, comment_id: commentId });
     }
   }
 }

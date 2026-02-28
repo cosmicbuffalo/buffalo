@@ -35,7 +35,7 @@ export function batchComments(
 const CLARIFICATION_INSTRUCTION =
   "If you need clarification before you can proceed, output a single line starting with exactly " +
   "`CLARIFICATION_NEEDED: ` followed by your question — e.g. `CLARIFICATION_NEEDED: Should the new function be async or sync?` " +
-  "— and do NOT include a COMMIT line. The bot will post your question to the PR and relay the human's answer back to you.";
+  "— and do NOT include a COMMIT line. If you do NOT need clarification, omit the line entirely (never output `CLARIFICATION_NEEDED: none`). The bot will post your question to the PR and relay the human's answer back to you.";
 
 function buildFooter(reviewComments: PRComment[]): string[] {
   const lines: string[] = [
@@ -207,7 +207,33 @@ export function extractCommitMessage(response: string | null): string | null {
 export function extractClarification(response: string | null): string | null {
   if (!response) return null;
   const match = response.match(new RegExp(`${LIST_PREFIX.source}CLARIFICATION_NEEDED:\\s*(.+)$`, "im"));
-  return match?.[1]?.trim() ?? null;
+  const raw = match?.[1]?.trim();
+  if (!raw) return null;
+
+  const cleaned = raw.replace(/^["'`]+|["'`]+$/g, "").trim();
+  if (!cleaned) return null;
+
+  const normalized = cleaned
+    .toLowerCase()
+    .replace(/[.!]+$/g, "")
+    .trim();
+  const placeholders = new Set([
+    "none",
+    "n/a",
+    "na",
+    "no",
+    "null",
+    "nil",
+    "none needed",
+    "not needed",
+    "no clarification",
+    "no clarification needed",
+    "no question",
+    "no questions",
+  ]);
+  if (placeholders.has(normalized)) return null;
+
+  return cleaned;
 }
 
 /**
@@ -257,7 +283,8 @@ export function buildIssuePrompt(issue: Issue, botTag: string): string {
     "  COMMIT: <commit message>",
     "  A description of what you changed (used as PR body).",
     "- If answering without code changes: just provide your response.",
-    "CLARIFICATION_NEEDED: <question> (if you need clarification before proceeding)",
+    "Only if you need clarification before proceeding: CLARIFICATION_NEEDED: <question>",
+    "If no clarification is needed, omit that line entirely (never output `CLARIFICATION_NEEDED: none`).",
   ];
 
   return lines.join("\n");
@@ -308,8 +335,16 @@ export function buildIssueFollowUpPrompt(
     `Do NOT run \`git add\`, \`git commit\`, \`git push\`, or open PRs yourself — the bot will handle that.`,
     "When finished, provide:",
     "- COMMIT: <commit message> (omit this line if no code changes were made)",
+    ...(existingPr
+      ? []
+      : [
+          "- If you made code changes that should become a PR:",
+          "  BRANCH_NAME: <short kebab-case branch, e.g. fix/login-session-expiry>",
+          "  PR_TITLE: <concise PR title>",
+        ]),
     "- A response to post as a comment on the issue.",
-    "CLARIFICATION_NEEDED: <question> (if you need clarification before proceeding)",
+    "Only if you need clarification before proceeding: CLARIFICATION_NEEDED: <question>",
+    "If no clarification is needed, omit that line entirely (never output `CLARIFICATION_NEEDED: none`).",
   );
 
   return lines.join("\n");

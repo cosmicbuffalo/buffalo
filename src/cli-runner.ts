@@ -127,15 +127,26 @@ export function readSessionOutput(id: RepoId, branch: string): SessionOutput {
   if (!rawLog) return { response: null, tokensUsed };
   const lines = stripAnsi(rawLog).split("\n").map((l) => l.trimEnd());
 
+  // When multiple sessions share a log file (pipe-pane appends on retry/follow-up),
+  // isolate the last session's output before searching for the tokens marker.
+  // Codex always prints a recognizable startup line; find the last one.
+  let sessionStart = 0;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^OpenAI Codex\b/i.test(lines[i].trim())) {
+      sessionStart = i;
+    }
+  }
+  const sessionLines = lines.slice(sessionStart);
+
   let splitAfter = -1;
-  for (let i = 0; i < lines.length - 1; i++) {
-    if (/^tokens\s+used\s*$/i.test(lines[i].trim())) {
-      const num = lines[i + 1]?.trim().match(/^([\d,]+)$/);
+  for (let i = 0; i < sessionLines.length - 1; i++) {
+    if (/^tokens\s+used\s*$/i.test(sessionLines[i].trim())) {
+      const num = sessionLines[i + 1]?.trim().match(/^([\d,]+)$/);
       if (num) splitAfter = i + 1; // index of the number line
     }
   }
 
-  const responseLines = splitAfter >= 0 ? lines.slice(splitAfter + 1) : lines.slice(-50);
+  const responseLines = splitAfter >= 0 ? sessionLines.slice(splitAfter + 1) : sessionLines.slice(-50);
   const stripped = stripTrailingPrompt(responseLines).filter((l) => l.trim().length > 0);
   const response = stripped.join("\n") || null;
   return { response, tokensUsed };
@@ -155,7 +166,9 @@ function writeCliScript(
   resume: boolean
 ): string {
   ensureDir(logDir(id));
-  const base = path.join(logDir(id), branch);
+  // Keep script/prompt artifacts aligned with logFile() naming so branch names
+  // containing "/" don't create unintended nested directories.
+  const base = logFile(id, branch).replace(/\.log$/, "");
   const promptFile = `${base}-prompt.txt`;
   const scriptFile = `${base}-run.sh`;
 

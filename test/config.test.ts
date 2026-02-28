@@ -33,6 +33,17 @@ describe("config", () => {
     assert.ok(dir.endsWith("workspaces/feature-x"));
   });
 
+  it("artifact paths flatten branch separators", async () => {
+    const config = await freshImport<typeof import("../src/config.js")>("../src/config.js");
+    const id = { owner: "acme", repo: "widgets" };
+    const branch = "buffalo/issue-8";
+    assert.ok(config.logFile(id, branch).endsWith("logs/buffalo__issue-8.log"));
+    assert.ok(
+      config.lastMessageFile(id, branch).endsWith("logs/buffalo__issue-8-last-message.txt")
+    );
+    assert.ok(config.historyFile(id, branch).endsWith("history/buffalo__issue-8.jsonl"));
+  });
+
   describe("global config", () => {
     it("returns defaults when no file exists", async () => {
       const config = await freshImport<typeof import("../src/config.js")>("../src/config.js");

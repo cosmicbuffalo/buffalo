@@ -44,6 +44,12 @@ export function workspaceDir(id: RepoId, branch: string): string {
   return path.join(repoDir(id), "workspaces", branch);
 }
 
+function artifactName(branch: string): string {
+  // Branch names often include "/" (e.g. "feature/x"). Use a flat filename for
+  // logs/history artifacts to avoid accidental nested paths under logs/history.
+  return branch.replace(/[\\/]/g, "__");
+}
+
 export function logDir(id: RepoId): string {
   return path.join(repoDir(id), "logs");
 }
@@ -53,15 +59,15 @@ export function historyDir(id: RepoId): string {
 }
 
 export function logFile(id: RepoId, branch: string): string {
-  return path.join(logDir(id), `${branch}.log`);
+  return path.join(logDir(id), `${artifactName(branch)}.log`);
 }
 
 export function lastMessageFile(id: RepoId, branch: string): string {
-  return path.join(logDir(id), `${branch}-last-message.txt`);
+  return path.join(logDir(id), `${artifactName(branch)}-last-message.txt`);
 }
 
 export function historyFile(id: RepoId, branch: string): string {
-  return path.join(historyDir(id), `${branch}.jsonl`);
+  return path.join(historyDir(id), `${artifactName(branch)}.jsonl`);
 }
 
 export function buffaloTmuxConf(): string {

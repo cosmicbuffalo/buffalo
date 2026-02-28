@@ -209,6 +209,12 @@ describe("batch", () => {
     it("returns null for null input", () => {
       assert.equal(extractClarification(null), null);
     });
+
+    it("returns null for placeholder clarification values", () => {
+      assert.equal(extractClarification("CLARIFICATION_NEEDED: none"), null);
+      assert.equal(extractClarification("CLARIFICATION_NEEDED: N/A"), null);
+      assert.equal(extractClarification("CLARIFICATION_NEEDED: no clarification needed."), null);
+    });
   });
 
   describe("stripDirectives", () => {

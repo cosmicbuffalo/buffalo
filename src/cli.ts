@@ -16,6 +16,11 @@ import {
 import { attachToTarget, attachToWindow, listWindows, destroySession } from "./tmux-manager.js";
 import { pauseSession, resumeSession, loadSessions, clearBranchResumable } from "./session-store.js";
 import { readHistory } from "./history.js";
+import { listOpenPRs } from "./github.js";
+import { ensureWorkspace, rollbackLastCommit } from "./repo-manager.js";
+import { buildPrompt } from "./batch.js";
+import { startCliSession } from "./cli-runner.js";
+import { setSession } from "./session-store.js";
 import { startPolling, stopPolling } from "./poller.js";
 import { runInit } from "./init.js";
 
@@ -123,6 +128,66 @@ function readPidFile(id: RepoId): number | null {
 
 function removePidFile(id: RepoId): void {
   try { fs.unlinkSync(pidFile(id)); } catch {}
+}
+
+function isControlComment(body: string, botUsername: string): boolean {
+  const lower = body.toLowerCase();
+  return (
+    lower.includes("allow once") ||
+    lower.includes("allow always") ||
+    lower.includes(`@${botUsername.toLowerCase()} deny`) ||
+    lower.includes(`@${botUsername.toLowerCase()} undo`) ||
+    lower.includes(`@${botUsername.toLowerCase()} try again`)
+  );
+}
+
+function findLastTaskRequest(id: RepoId, branch: string, prNumber: number, botUsername: string): string | null {
+  const events = readHistory(id, branch).slice().reverse();
+  for (const e of events) {
+    if (e.type !== "comment_detected") continue;
+    if (e.pr !== prNumber) continue;
+    const body = typeof e.body === "string" ? e.body : "";
+    if (!body) continue;
+    if (isControlComment(body, botUsername)) continue;
+    return body;
+  }
+  return null;
+}
+
+async function resolveRepoAndBranch(rest: string[]): Promise<{ id: RepoId; branch: string; restAfterBranch: string[] }> {
+  const explicit = rest[0] ? parseRepoArg(rest[0]) : null;
+  if (explicit) {
+    if (!hasExistingConfig(explicit)) {
+      console.error(
+        `${explicit.owner}/${explicit.repo} is not an initialized Buffalo repo.\n` +
+        `Run \`buffalo init\` in the repo directory first.`
+      );
+      process.exit(1);
+    }
+    const branch = rest[1];
+    if (!branch) {
+      console.error("Branch is required when specifying owner/repo. Usage: buffalo <undo|retry> owner/repo <branch> [note]");
+      process.exit(1);
+    }
+    return { id: explicit, branch, restAfterBranch: rest.slice(2) };
+  }
+
+  const id = requireRepo();
+  const branch = rest[0] ?? getCurrentBranch();
+  if (!branch) {
+    console.error("No branch specified and unable to detect current branch.");
+    process.exit(1);
+  }
+  return { id, branch, restAfterBranch: rest.slice(1) };
+}
+
+async function resolveOpenPrByBranch(id: RepoId, branch: string): Promise<{ number: number; branch: string; cloneUrl: string }> {
+  const prs = await listOpenPRs(id);
+  const pr = prs.find((p) => p.branch === branch);
+  if (!pr) {
+    throw new Error(`No open PR found for branch '${branch}'`);
+  }
+  return pr;
 }
 
 export async function dispatch(args: string[]): Promise<void> {
@@ -356,6 +421,73 @@ export async function dispatch(args: string[]): Promise<void> {
       break;
     }
 
+    case "undo": {
+      const { id, branch } = await resolveRepoAndBranch(rest);
+      try {
+        const pr = await resolveOpenPrByBranch(id, branch);
+        const cwd = ensureWorkspace(id, branch, pr.cloneUrl);
+        void cwd;
+        const newHead = rollbackLastCommit(id, branch);
+        console.log(`${id.owner}/${id.repo} ${branch}: rolled back last commit, new HEAD ${newHead}`);
+      } catch (err: any) {
+        console.error(`Undo failed: ${err?.message ?? err}`);
+        process.exit(1);
+      }
+      break;
+    }
+
+    case "retry": {
+      const { id, branch, restAfterBranch } = await resolveRepoAndBranch(rest);
+      const note = restAfterBranch.join(" ").trim();
+      try {
+        const cfg = loadRepoConfig(id);
+        const pr = await resolveOpenPrByBranch(id, branch);
+        const cwd = ensureWorkspace(id, branch, pr.cloneUrl);
+        const newHead = rollbackLastCommit(id, branch);
+        const original = findLastTaskRequest(id, branch, pr.number, cfg.botUsername);
+        const originalBody = original
+          ? original.replace(new RegExp(`@${cfg.botUsername}`, "gi"), "").trim()
+          : "(original request not found in history)";
+        const retryBody = [
+          `@${cfg.botUsername} Retry the previous request using a different approach.`,
+          `Original request: ${originalBody}`,
+          note ? `Additional guidance: ${note}` : null,
+        ].filter(Boolean).join("\n");
+        const prompt = buildPrompt({
+          prNumber: pr.number,
+          branch,
+          comments: [{
+            id: Date.now(),
+            body: retryBody,
+            user: "manual",
+            prNumber: pr.number,
+            createdAt: new Date().toISOString(),
+            htmlUrl: "",
+            commentType: "issue",
+          }],
+        }, `@${cfg.botUsername}`);
+
+        startCliSession(id, branch, prompt, cwd, pr.number);
+        setSession(id, branch, {
+          branch,
+          prNumber: pr.number,
+          commentIds: [],
+          triggerComments: [{
+            user: "manual",
+            body: note ? `retry: ${note}` : "retry",
+          }],
+          status: "running",
+          logOffset: 0,
+        });
+
+        console.log(`${id.owner}/${id.repo} ${branch}: rolled back to ${newHead} and started retry session`);
+      } catch (err: any) {
+        console.error(`Retry failed: ${err?.message ?? err}`);
+        process.exit(1);
+      }
+      break;
+    }
+
     case "list": {
       const windows = listWindows();
       if (windows.length === 0) {
@@ -447,6 +579,9 @@ Usage:
   buffalo pause [branch]              Pause a session
   buffalo resume [branch]             Resume a session
   buffalo fresh [branch]              Clear codex context — next session starts fresh
+  buffalo undo [owner/repo] [branch] Roll back latest commit on PR branch
+  buffalo retry [owner/repo] [branch] [note]
+                                     Roll back latest commit and rerun with retry guidance
   buffalo list                        List active tmux windows
   buffalo logs [branch]               Tail log for a branch
   buffalo history [branch]            Show action history

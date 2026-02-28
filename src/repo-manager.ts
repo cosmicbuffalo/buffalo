@@ -72,6 +72,22 @@ export function commitAndPush(
 }
 
 /**
+ * Roll back the latest commit on a branch and force-push.
+ * Returns the new HEAD short SHA after rollback.
+ */
+export function rollbackLastCommit(
+  id: RepoId,
+  branch: string
+): string {
+  const dir = workspaceDir(id, branch);
+  // Ensure there is at least one parent to roll back to.
+  run("git rev-parse --verify HEAD~1", dir);
+  run("git reset --hard HEAD~1", dir);
+  run(`git push --force-with-lease origin ${branch}`, dir);
+  return run("git rev-parse --short HEAD", dir);
+}
+
+/**
  * Clone the default branch into a fresh workspace for an issue session.
  * Does NOT create a local branch — codex works against uncommitted changes only.
  */

@@ -277,6 +277,26 @@ export async function createPullRequest(
 }
 
 /**
+ * Delete a comment by ID. Uses the configured bot token.
+ * Failures are logged but not thrown — deletion is best-effort cleanup.
+ */
+export async function deleteComment(
+  id: RepoId,
+  commentId: number,
+  commentType: "issue" | "review" = "issue"
+): Promise<void> {
+  const endpoint = commentType === "review"
+    ? `repos/${id.owner}/${id.repo}/pulls/comments/${commentId}`
+    : `repos/${id.owner}/${id.repo}/issues/comments/${commentId}`;
+  try {
+    await ghRun(["api", endpoint, "--method", "DELETE"], getBotToken(id));
+    console.log(`[buffalo] Deleted comment ${commentId}`);
+  } catch (err: any) {
+    console.warn(`[buffalo] Warning: could not delete comment ${commentId} (${err.message?.split("\n")[0]})`);
+  }
+}
+
+/**
  * React to an issue body (not a comment).
  */
 export async function reactToIssue(
