@@ -38,14 +38,36 @@ describe("config", () => {
       const config = await freshImport<typeof import("../src/config.js")>("../src/config.js");
       const cfg = config.loadGlobalConfig();
       assert.equal(cfg.githubToken, "");
+      assert.equal(cfg.botUsername, "");
       assert.deepEqual(cfg.authorizedUsers, []);
       assert.equal(cfg.defaultBackend, "claude");
+    });
+
+    it("fills missing fields from defaults when loading a partial global config", async () => {
+      const config = await freshImport<typeof import("../src/config.js")>("../src/config.js");
+      // Write a config that is missing botUsername (simulates an old config file)
+      const fs = await import("node:fs");
+      const path = await import("node:path");
+      const cfgPath = path.join(config.buffaloDir(), "config.json");
+      config.ensureDir(config.buffaloDir());
+      fs.writeFileSync(cfgPath, JSON.stringify({
+        githubToken: "ghp_old",
+        authorizedUsers: ["alice"],
+        defaultBackend: "codex",
+        pollIntervalMs: 60000,
+      }) + "\n");
+
+      const loaded = config.loadGlobalConfig();
+      assert.equal(loaded.githubToken, "ghp_old");
+      assert.equal(loaded.botUsername, ""); // filled in from DEFAULT_GLOBAL
+      assert.equal(loaded.defaultBackend, "codex");
     });
 
     it("saves and loads global config", async () => {
       const config = await freshImport<typeof import("../src/config.js")>("../src/config.js");
       const cfg = {
         githubToken: "ghp_test123",
+        botUsername: "my-bot",
         authorizedUsers: ["alice", "bob"],
         defaultBackend: "codex" as const,
         pollIntervalMs: 30000,
@@ -61,6 +83,7 @@ describe("config", () => {
       const config = await freshImport<typeof import("../src/config.js")>("../src/config.js");
       config.saveGlobalConfig({
         githubToken: "ghp_test",
+        botUsername: "global-bot",
         authorizedUsers: ["alice"],
         defaultBackend: "claude",
         pollIntervalMs: 60000,

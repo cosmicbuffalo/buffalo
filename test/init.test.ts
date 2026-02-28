@@ -123,6 +123,53 @@ describe("init", () => {
     });
   });
 
+  describe("global config inheritance", () => {
+    it("repo config inherits botUsername and authorizedUsers from global when not overridden", async () => {
+      const config = await import("../src/config.js");
+      const repoId = { owner: "acme", repo: "widgets" };
+
+      // Simulate first init: save to global, write {} to repo
+      config.saveGlobalConfig({
+        githubToken: "ghp_global",
+        botUsername: "global-bot",
+        authorizedUsers: ["alice"],
+        defaultBackend: "claude",
+        pollIntervalMs: 900000,
+      });
+      config.saveRepoConfig(repoId, {});
+
+      const repoCfg = config.loadRepoConfig(repoId);
+      assert.equal(repoCfg.botUsername, "global-bot");
+      assert.deepEqual(repoCfg.authorizedUsers, ["alice"]);
+      assert.equal(repoCfg.backend, "claude");
+      assert.equal(repoCfg.pollIntervalMs, 900000);
+      // githubToken is not propagated through loadRepoConfig; getBotToken reads it directly
+      assert.equal(repoCfg.githubToken, undefined);
+    });
+
+    it("repo config override wins over global", async () => {
+      const config = await import("../src/config.js");
+      const repoId = { owner: "acme", repo: "widgets" };
+
+      config.saveGlobalConfig({
+        githubToken: "ghp_global",
+        botUsername: "global-bot",
+        authorizedUsers: ["alice"],
+        defaultBackend: "claude",
+        pollIntervalMs: 900000,
+      });
+      // Simulate subsequent init with repo-specific overrides
+      config.saveRepoConfig(repoId, { botUsername: "repo-bot", backend: "codex" });
+
+      const repoCfg = config.loadRepoConfig(repoId);
+      assert.equal(repoCfg.botUsername, "repo-bot");
+      assert.equal(repoCfg.backend, "codex");
+      // Non-overridden fields still fall back to global
+      assert.deepEqual(repoCfg.authorizedUsers, ["alice"]);
+      assert.equal(repoCfg.pollIntervalMs, 900000);
+    });
+  });
+
   describe("hasExistingConfig detection", () => {
     it("returns false when no config exists", async () => {
       const config = await import("../src/config.js");

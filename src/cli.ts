@@ -256,8 +256,6 @@ export async function dispatch(args: string[]): Promise<void> {
     case "attach": {
       const branchArg = rest.find((a) => !a.startsWith("-"));
 
-      // Discover sessions directly from the buffalo tmux socket — no filesystem
-      // guessing needed. listWindows() already filters to buffalo- sessions.
       const allWindows = listWindows();
 
       if (allWindows.length === 0) {
@@ -265,15 +263,33 @@ export async function dispatch(args: string[]): Promise<void> {
         break;
       }
 
-      // Filter by branch if one was specified
-      const candidates = branchArg
-        ? allWindows.filter((w) => w.window === branchArg)
-        : allWindows;
+      // Narrow to repos that are both detected in cwd AND have a buffalo config.
+      // If we're not in a git repo (no remotes), show all windows as fallback.
+      const localRemotes = detectAllRemotes();
+      const configuredSessions = new Set(
+        localRemotes
+          .filter((r) =>
+            fs.existsSync(path.join(repoDir({ owner: r.owner, repo: r.repo }), "config.json"))
+          )
+          .map((r) => `buffalo-${r.owner}-${r.repo}`)
+      );
+
+      let candidates =
+        configuredSessions.size > 0
+          ? allWindows.filter((w) => configuredSessions.has(w.session))
+          : allWindows;
+
+      // Further filter by branch if one was specified
+      if (branchArg) {
+        candidates = candidates.filter((w) => w.window === branchArg);
+      }
 
       if (candidates.length === 0) {
-        console.error(`[buffalo] No session found for branch '${branchArg}'.`);
-        console.log("Active sessions:");
-        for (const w of allWindows) console.log(`  ${w.session}:${w.window}`);
+        if (branchArg) {
+          console.error(`[buffalo] No session found for branch '${branchArg}'.`);
+        } else {
+          console.error("[buffalo] No active sessions for configured repos in this directory.");
+        }
         break;
       }
 

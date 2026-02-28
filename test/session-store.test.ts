@@ -117,6 +117,39 @@ describe("session-store", () => {
     assert.deepEqual([...loaded].sort((a, b) => a - b), [101, 202, 303]);
   });
 
+  it("markBranchResumable / shouldResumeBranch / clearBranchResumable", async () => {
+    const store = await freshImport<typeof import("../src/session-store.js")>(
+      "../src/session-store.js"
+    );
+    assert.equal(store.shouldResumeBranch(repoId, "feature"), false);
+
+    store.markBranchResumable(repoId, "feature");
+    assert.equal(store.shouldResumeBranch(repoId, "feature"), true);
+
+    // Marking again is idempotent
+    store.markBranchResumable(repoId, "feature");
+    assert.equal(store.shouldResumeBranch(repoId, "feature"), true);
+
+    store.clearBranchResumable(repoId, "feature");
+    assert.equal(store.shouldResumeBranch(repoId, "feature"), false);
+
+    // Clearing when not marked is safe
+    store.clearBranchResumable(repoId, "feature");
+    assert.equal(store.shouldResumeBranch(repoId, "feature"), false);
+  });
+
+  it("resume state is independent per branch", async () => {
+    const store = await freshImport<typeof import("../src/session-store.js")>(
+      "../src/session-store.js"
+    );
+    store.markBranchResumable(repoId, "branch-a");
+    store.markBranchResumable(repoId, "branch-b");
+
+    store.clearBranchResumable(repoId, "branch-a");
+    assert.equal(store.shouldResumeBranch(repoId, "branch-a"), false);
+    assert.equal(store.shouldResumeBranch(repoId, "branch-b"), true);
+  });
+
   it("preserves multiple sessions independently", async () => {
     const store = await freshImport<typeof import("../src/session-store.js")>(
       "../src/session-store.js"

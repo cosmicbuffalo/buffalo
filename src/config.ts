@@ -10,6 +10,7 @@ export interface RepoId {
 
 export interface GlobalConfig {
   githubToken: string;
+  botUsername: string;
   authorizedUsers: string[];
   defaultBackend: "claude" | "codex";
   pollIntervalMs: number;
@@ -104,13 +105,18 @@ function writeJson(filePath: string, data: unknown): void {
 
 const DEFAULT_GLOBAL: GlobalConfig = {
   githubToken: "",
+  botUsername: "",
   authorizedUsers: [],
   defaultBackend: "claude",
   pollIntervalMs: 15 * 60 * 1000,
 };
 
 export function loadGlobalConfig(): GlobalConfig {
-  return readJson(path.join(getBuffaloDir(), "config.json"), DEFAULT_GLOBAL);
+  const stored = readJson<Partial<GlobalConfig>>(
+    path.join(getBuffaloDir(), "config.json"),
+    {}
+  );
+  return { ...DEFAULT_GLOBAL, ...stored };
 }
 
 export function saveGlobalConfig(cfg: GlobalConfig): void {
@@ -120,7 +126,7 @@ export function saveGlobalConfig(cfg: GlobalConfig): void {
 export function loadRepoConfig(id: RepoId): RepoConfig {
   const global = loadGlobalConfig();
   const defaults: RepoConfig = {
-    botUsername: "",
+    botUsername: global.botUsername,
     authorizedUsers: global.authorizedUsers,
     backend: global.defaultBackend,
     pollIntervalMs: global.pollIntervalMs,
@@ -132,7 +138,7 @@ export function loadRepoConfig(id: RepoId): RepoConfig {
   return { ...defaults, ...repo };
 }
 
-export function saveRepoConfig(id: RepoId, cfg: RepoConfig): void {
+export function saveRepoConfig(id: RepoId, cfg: Partial<RepoConfig>): void {
   writeJson(path.join(repoDir(id), "config.json"), cfg);
 }
 

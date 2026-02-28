@@ -5,11 +5,13 @@ import {
   type RemoteInfo,
   detectAllRemotes,
   initBuffaloDir,
+  buffaloDir,
   repoDir,
   ensureDir,
   saveRepoConfig,
+  saveGlobalConfig,
+  loadGlobalConfig,
   loadRepoConfig,
-  type RepoConfig,
   logDir,
   historyDir,
 } from "./config.js";
@@ -21,6 +23,14 @@ function obscureToken(token: string): string {
 
 function hasExistingConfig(id: RepoId): boolean {
   return fs.existsSync(path.join(repoDir(id), "config.json"));
+}
+
+function setupRepoDirs(id: RepoId): void {
+  const rd = repoDir(id);
+  ensureDir(rd);
+  ensureDir(path.join(rd, "workspaces"));
+  ensureDir(logDir(id));
+  ensureDir(historyDir(id));
 }
 
 export async function runInit(): Promise<void> {
@@ -36,7 +46,6 @@ export async function runInit(): Promise<void> {
   let selectedRepos: RepoId[] = [];
 
   if (remotes.length > 1) {
-    // Multiple remotes — let the user pick
     const choices = remotes.map((r) => {
       const existing = hasExistingConfig(r);
       return {
@@ -77,7 +86,6 @@ export async function runInit(): Promise<void> {
   }
 
   if (selectedRepos.length === 0) {
-    // Manual entry
     console.log(
       remotes.length === 0
         ? "Could not detect any git remotes."
@@ -90,42 +98,36 @@ export async function runInit(): Promise<void> {
     selectedRepos = [{ owner, repo }];
   }
 
-  // Configure each selected repo
-  for (const repoId of selectedRepos) {
-    console.log(`\n--- Configuring ${repoId.owner}/${repoId.repo} ---\n`);
+  const globalCfgPath = path.join(buffaloDir(), "config.json");
+  const isFirstInit = !fs.existsSync(globalCfgPath);
+  const globalCfg = loadGlobalConfig();
 
-    // Load existing config for prefilling
-    const existing = hasExistingConfig(repoId)
-      ? loadRepoConfig(repoId)
-      : null;
+  if (isFirstInit) {
+    // ── First-time setup: collect and save global defaults ─────────────────
+    console.log(
+      "First-time setup — answers will be saved as global defaults for all repos.\n"
+    );
 
-    // GitHub PAT
-    const tokenMessage = existing?.githubToken
-      ? `GitHub PAT (current: ${obscureToken(existing.githubToken)}, press Enter to keep):`
-      : "GitHub Personal Access Token (for bot account):";
     const { token } = await prompt([
       {
         type: "password",
         name: "token",
-        message: tokenMessage,
+        message: "GitHub Personal Access Token (for bot account):",
         mask: "*",
       },
     ]);
-    const finalToken = token || existing?.githubToken || "";
 
-    // Bot username
     console.log(
       "\n  Buffalo works by monitoring PR comments that @mention a dedicated\n" +
-      "  GitHub bot account. Enter the GitHub username of the bot account\n" +
-      "  that will be used to run Buffalo (e.g. \"my-buffalo-bot\").\n" +
-      "  Comments tagging @<username> on PRs will trigger the bot.\n"
+        "  GitHub bot account. Enter the GitHub username of the bot account\n" +
+        "  that will be used to run Buffalo (e.g. \"my-buffalo-bot\").\n" +
+        "  Comments tagging @<username> on PRs will trigger the bot.\n"
     );
     const { botUsername } = await prompt([
       {
         type: "input",
         name: "botUsername",
         message: "Bot account GitHub username (without @):",
-        default: existing?.botUsername ?? undefined,
         validate: (v: string) => {
           if (!v.trim()) return "A bot username is required.";
           if (v.startsWith("@")) return "Enter the username without the @ prefix.";
@@ -134,14 +136,11 @@ export async function runInit(): Promise<void> {
       },
     ]);
 
-    // Authorized users
-    const existingUsers = existing?.authorizedUsers?.join(", ") ?? "";
     const { usersStr } = await prompt([
       {
         type: "input",
         name: "usersStr",
         message: "Authorized GitHub usernames (comma-separated):",
-        default: existingUsers || undefined,
       },
     ]);
     const authorizedUsers = usersStr
@@ -149,36 +148,127 @@ export async function runInit(): Promise<void> {
       .map((u: string) => u.trim())
       .filter(Boolean);
 
-    // CLI backend
     const { backend } = await prompt([
       {
         type: "list",
         name: "backend",
         message: "CLI backend:",
         choices: ["claude", "codex"],
-        default: existing?.backend ?? "claude",
+        default: "claude",
       },
     ]);
 
-    // Save config
-    const cfg: RepoConfig = {
+    saveGlobalConfig({
+      githubToken: token,
       botUsername: botUsername.trim(),
       authorizedUsers,
-      backend,
-      pollIntervalMs: existing?.pollIntervalMs ?? 15 * 60 * 1000,
-      githubToken: finalToken,
-    };
+      defaultBackend: backend,
+      pollIntervalMs: 15 * 60 * 1000,
+    });
 
-    const rd = repoDir(repoId);
-    ensureDir(rd);
-    ensureDir(path.join(rd, "workspaces"));
-    ensureDir(logDir(repoId));
-    ensureDir(historyDir(repoId));
+    console.log("\n✅ Global config saved.\n");
 
-    saveRepoConfig(repoId, cfg);
+    for (const id of selectedRepos) {
+      setupRepoDirs(id);
+      saveRepoConfig(id, {});
+      console.log(`✅ Configured ${id.owner}/${id.repo}`);
+      console.log(`   Config: ${repoDir(id)}/config.json`);
+    }
+  } else {
+    // ── Subsequent init: per-repo with global pre-fill ──────────────────────
+    console.log(
+      `Global config loaded (bot: @${globalCfg.botUsername || "(not set)"})\n` +
+        `Showing global defaults — press Enter to accept, or type a new value to override for this repo.\n`
+    );
 
-    console.log(`✅ Configured ${repoId.owner}/${repoId.repo}`);
-    console.log(`   Config: ${rd}/config.json`);
+    for (const id of selectedRepos) {
+      console.log(`\n--- Configuring ${id.owner}/${id.repo} ---\n`);
+
+      // Effective values: global merged with any existing repo overrides
+      const effective = loadRepoConfig(id);
+
+      // GitHub PAT
+      const tokenCurrent = effective.githubToken ?? globalCfg.githubToken;
+      const tokenMsg = tokenCurrent
+        ? `GitHub PAT (current: ${obscureToken(tokenCurrent)}, press Enter to keep):`
+        : "GitHub Personal Access Token (leave blank to use global):";
+      const { token } = await prompt([
+        { type: "password", name: "token", message: tokenMsg, mask: "*" },
+      ]);
+      const finalToken = token || tokenCurrent || "";
+
+      // Bot username
+      const { botUsername } = await prompt([
+        {
+          type: "input",
+          name: "botUsername",
+          message: "Bot account GitHub username (without @):",
+          default: effective.botUsername || undefined,
+          validate: (v: string) => {
+            if (!v.trim()) return "A bot username is required.";
+            if (v.startsWith("@")) return "Enter the username without the @ prefix.";
+            return true;
+          },
+        },
+      ]);
+
+      // Authorized users
+      const { usersStr } = await prompt([
+        {
+          type: "input",
+          name: "usersStr",
+          message: "Authorized GitHub usernames (comma-separated):",
+          default: effective.authorizedUsers?.join(", ") || undefined,
+        },
+      ]);
+      const authorizedUsers = usersStr
+        .split(",")
+        .map((u: string) => u.trim())
+        .filter(Boolean);
+
+      // Backend
+      const { backend } = await prompt([
+        {
+          type: "list",
+          name: "backend",
+          message: "CLI backend:",
+          choices: ["claude", "codex"],
+          default: effective.backend ?? globalCfg.defaultBackend ?? "claude",
+        },
+      ]);
+
+      // Build overrides: only save values that differ from global
+      const overrides: Partial<ReturnType<typeof loadRepoConfig>> = {};
+
+      if (finalToken && finalToken !== globalCfg.githubToken) {
+        overrides.githubToken = finalToken;
+      }
+      const trimmedBot = botUsername.trim();
+      if (trimmedBot !== globalCfg.botUsername) {
+        overrides.botUsername = trimmedBot;
+      }
+      const authSorted = [...authorizedUsers].sort().join(",");
+      const globalAuthSorted = [...(globalCfg.authorizedUsers ?? [])].sort().join(",");
+      if (authSorted !== globalAuthSorted) {
+        overrides.authorizedUsers = authorizedUsers;
+      }
+      if (backend !== globalCfg.defaultBackend) {
+        overrides.backend = backend;
+      }
+
+      setupRepoDirs(id);
+      saveRepoConfig(id, overrides);
+
+      const overrideKeys = Object.keys(overrides);
+      if (overrideKeys.length > 0) {
+        console.log(
+          `✅ Configured ${id.owner}/${id.repo} (repo overrides: ${overrideKeys.join(", ")})`
+        );
+      } else {
+        console.log(`✅ Configured ${id.owner}/${id.repo} (using global defaults)`);
+      }
+      console.log(`   Config: ${repoDir(id)}/config.json`);
+    }
   }
 
   console.log(`\nRemember to add the bot user as a collaborator on each repo.`);
