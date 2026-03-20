@@ -49,6 +49,29 @@ function extractLastOutput(rawLog: string): string {
   return joined.length > MAX ? `…\n${joined.slice(-MAX)}` : joined;
 }
 
+function normalizeLine(line: string): string {
+  return stripAnsi(line).trim();
+}
+
+function findLastResponseStart(lines: string[]): number {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (/^\s*RESPONSE\[\d+\]:/i.test(normalizeLine(lines[i]))) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function isDiffBoundary(line: string): boolean {
+  const normalized = normalizeLine(line);
+  return (
+    /^file update:/i.test(normalized) ||
+    /^diff --git\b/i.test(normalized) ||
+    /^@@\s/.test(normalized) ||
+    /^index\s[0-9a-f]+\.\.[0-9a-f]+$/i.test(normalized)
+  );
+}
+
 export interface SessionOutput {
   response: string | null;
   tokensUsed: number | null;
@@ -146,9 +169,25 @@ export function readSessionOutput(id: RepoId, branch: string): SessionOutput {
     }
   }
 
-  const responseLines = splitAfter >= 0 ? sessionLines.slice(splitAfter + 1) : sessionLines.slice(-50);
-  const stripped = stripTrailingPrompt(responseLines).filter((l) => l.trim().length > 0);
-  const response = stripped.join("\n") || null;
+  let responseLines: string[] = [];
+
+  const afterTokens = splitAfter >= 0 ? sessionLines.slice(splitAfter + 1) : [];
+  const trimmedAfterTokens = stripTrailingPrompt(afterTokens).filter((l) => l.trim().length > 0);
+  if (trimmedAfterTokens.length > 0) {
+    responseLines = trimmedAfterTokens;
+  } else {
+    const beforeTokens = splitAfter >= 0 ? sessionLines.slice(0, splitAfter) : sessionLines;
+    const responseStart = findLastResponseStart(beforeTokens);
+    if (responseStart >= 0) {
+      const candidate = beforeTokens.slice(responseStart);
+      const boundary = candidate.findIndex((line, idx) => idx > 0 && isDiffBoundary(line));
+      responseLines = boundary === -1 ? candidate : candidate.slice(0, Math.max(1, boundary));
+    } else {
+      responseLines = beforeTokens.slice(-50);
+    }
+    responseLines = stripTrailingPrompt(responseLines).filter((l) => l.trim().length > 0);
+  }
+  const response = responseLines.join("\n").trim() || null;
   return { response, tokensUsed };
 }
 

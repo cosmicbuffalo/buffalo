@@ -176,4 +176,54 @@ describe("cli-runner", () => {
       runner.handleApproval(repoId, "nonexistent", "deny");
     });
   });
+
+  describe("readSessionOutput", () => {
+    it("extracts response content when it appears before the tokens marker", async () => {
+      const runner = await import("../src/cli-runner.js");
+      const config = await import("../src/config.js");
+      const branch = "response-before-tokens";
+      const logPath = config.logFile(repoId, branch);
+      fs.writeFileSync(
+        logPath,
+        [
+          "OpenAI Codex\n",
+          "some noise before response\n",
+          "\u001b[35m\u001b[3mcodex\u001b[0m\u001b[0m",
+          "RESPONSE[123]: inline fix is complete",
+          "COMMIT: docs: test reply ordering",
+          "\u001b[3m\u001b[35mfile update:\u001b[0m\u001b[0m",
+          "diff --git a/file b/file",
+          "\u001b[35m\u001b[3mtokens used\u001b[0m\u001b[0m",
+          "12,345",
+        ].join("\n")
+      );
+
+      const result = await runner.readSessionOutput(repoId, branch);
+      assert.ok(result.response);
+      assert.equal(
+        result.response,
+        "RESPONSE[123]: inline fix is complete\nCOMMIT: docs: test reply ordering"
+      );
+      assert.equal(result.tokensUsed, 12345);
+    });
+
+    it("continues to use lines after tokens marker when present", async () => {
+      const runner = await import("../src/cli-runner.js");
+      const config = await import("../src/config.js");
+      const branch = "response-after-tokens";
+      const logPath = config.logFile(repoId, branch);
+      fs.writeFileSync(
+        logPath,
+        [
+          "OpenAI Codex",
+          "Tokens used",
+          "12,345",
+          "RESPONSE[999]: trailing response",
+        ].join("\n")
+      );
+
+      const result = await runner.readSessionOutput(repoId, branch);
+      assert.equal(result.response, "RESPONSE[999]: trailing response");
+    });
+  });
 });

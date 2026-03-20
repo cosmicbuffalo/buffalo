@@ -70,6 +70,10 @@ export function historyFile(id: RepoId, branch: string): string {
   return path.join(historyDir(id), `${artifactName(branch)}.jsonl`);
 }
 
+export function daemonErrorLog(): string {
+  return path.join(getBuffaloDir(), "daemon-errors.log");
+}
+
 export function buffaloTmuxConf(): string {
   return path.join(getBuffaloDir(), "tmux.conf");
 }
