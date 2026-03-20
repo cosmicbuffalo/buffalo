@@ -1,5 +1,7 @@
 import type { PRComment, Issue, IssueComment } from "./github.js";
 import type { SessionInfo } from "./session-store.js";
+import type { RepoId } from "./config.js";
+import { readHistory } from "./history.js";
 
 export interface CommentBatch {
   prNumber: number;
@@ -348,4 +350,41 @@ export function buildIssueFollowUpPrompt(
   );
 
   return lines.join("\n");
+}
+
+/**
+ * Check if a comment body is a control command (allow/deny/undo/retry).
+ */
+export function isControlComment(body: string, botUsername: string): boolean {
+  const lower = body.toLowerCase();
+  const bot = `@${botUsername.toLowerCase()}`;
+  return (
+    lower.includes("allow once") ||
+    lower.includes("allow always") ||
+    lower.includes(`${bot} deny`) ||
+    lower.includes(`${bot} undo`) ||
+    lower.includes(`${bot} try again`) ||
+    lower.includes(`${bot} retry`)
+  );
+}
+
+/**
+ * Find the last non-control task request from history for a given branch/PR.
+ */
+export function findLastTaskRequest(
+  id: RepoId,
+  branch: string,
+  prNumber: number,
+  botUsername: string
+): string | null {
+  const events = readHistory(id, branch).slice().reverse();
+  for (const e of events) {
+    if (e.type !== "comment_detected") continue;
+    if (e.pr !== prNumber) continue;
+    const body = typeof e.body === "string" ? e.body : "";
+    if (!body) continue;
+    if (isControlComment(body, botUsername)) continue;
+    return body;
+  }
+  return null;
 }

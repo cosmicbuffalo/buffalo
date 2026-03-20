@@ -17,13 +17,16 @@
     "dist/src/**/*",
     "install.sh"
   ],
-  "keywords": ["github", "bot", "pr", "collaborator"],
+  "keywords": [
+    "github",
+    "bot",
+    "pr",
+    "collaborator"
+  ],
   "author": "",
   "type": "module",
   "license": "MIT",
   "dependencies": {
-    "@octokit/rest": "^21.0.0",
-    "chokidar": "^4.0.0",
     "inquirer": "^12.0.0"
   },
   "devDependencies": {

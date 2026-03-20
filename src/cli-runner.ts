@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { type RepoId, loadRepoConfig, logFile, logDir, lastMessageFile, ensureDir } from "./config.js";
+import { type RepoId, loadRepoConfig, logFile, logDir, lastMessageFile, ensureDir, type RepoConfig } from "./config.js";
 import { createWindow, runInWindow, pipeOutput, sendKeys, windowExists, ensureSession, destroyWindow } from "./tmux-manager.js";
 import { checkCommand, addRepoPattern } from "./command-guard.js";
 import { appendHistory } from "./history.js";
@@ -23,8 +23,8 @@ const STARTUP_PATTERNS = [
   /Do you trust the contents of this directory/i,
 ];
 
-// How long (ms) with no new log output before we consider the CLI idle/waiting
-const IDLE_TIMEOUT_MS = 90_000;
+// Default idle timeout — overridden by config.idleTimeoutMs when available
+const DEFAULT_IDLE_TIMEOUT_MS = 90_000;
 
 /** Strip ANSI/VT escape sequences and carriage returns from terminal output. */
 function stripAnsi(raw: string): string {
@@ -278,9 +278,15 @@ export async function monitorSession(
 
   // Check for approval prompts
   for (const pattern of APPROVAL_PATTERNS) {
-    if (pattern.test(newContent)) {
-      // Extract the command being requested
-      const cmdMatch = newContent.match(/[`"]([^`"]+)[`"]/);
+    const approvalMatch = pattern.exec(newContent);
+    if (approvalMatch) {
+      // Extract the command near the approval prompt, not from the start of the chunk.
+      // Look in a window around the match to avoid picking up unrelated quoted strings.
+      const matchPos = approvalMatch.index;
+      const contextStart = Math.max(0, matchPos - 200);
+      const contextEnd = Math.min(newContent.length, matchPos + approvalMatch[0].length + 500);
+      const vicinity = newContent.slice(contextStart, contextEnd);
+      const cmdMatch = vicinity.match(/[`"]([^`"]+)[`"]/);
       const command = cmdMatch ? cmdMatch[1] : "unknown command";
 
       const result = checkCommand(command, id);
@@ -341,7 +347,8 @@ export async function monitorSession(
     try {
       const stat = fs.statSync(log);
       const idleMs = Date.now() - stat.mtimeMs;
-      if (idleMs >= IDLE_TIMEOUT_MS) {
+      const idleTimeout = loadRepoConfig(id).idleTimeoutMs || DEFAULT_IDLE_TIMEOUT_MS;
+      if (idleMs >= idleTimeout) {
         console.log(
           `[buffalo] Session ${branch} idle for ${Math.round(idleMs / 1000)}s — closing window`
         );

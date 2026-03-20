@@ -18,7 +18,7 @@ import { pauseSession, resumeSession, loadSessions, clearBranchResumable } from 
 import { readHistory } from "./history.js";
 import { listOpenPRs } from "./github.js";
 import { ensureWorkspace, rollbackLastCommit } from "./repo-manager.js";
-import { buildPrompt } from "./batch.js";
+import { buildPrompt, isControlComment, findLastTaskRequest } from "./batch.js";
 import { startCliSession } from "./cli-runner.js";
 import { setSession } from "./session-store.js";
 import { startPolling, stopPolling } from "./poller.js";
@@ -130,30 +130,6 @@ function removePidFile(id: RepoId): void {
   try { fs.unlinkSync(pidFile(id)); } catch {}
 }
 
-function isControlComment(body: string, botUsername: string): boolean {
-  const lower = body.toLowerCase();
-  return (
-    lower.includes("allow once") ||
-    lower.includes("allow always") ||
-    lower.includes(`@${botUsername.toLowerCase()} deny`) ||
-    lower.includes(`@${botUsername.toLowerCase()} undo`) ||
-    lower.includes(`@${botUsername.toLowerCase()} try again`)
-  );
-}
-
-function findLastTaskRequest(id: RepoId, branch: string, prNumber: number, botUsername: string): string | null {
-  const events = readHistory(id, branch).slice().reverse();
-  for (const e of events) {
-    if (e.type !== "comment_detected") continue;
-    if (e.pr !== prNumber) continue;
-    const body = typeof e.body === "string" ? e.body : "";
-    if (!body) continue;
-    if (isControlComment(body, botUsername)) continue;
-    return body;
-  }
-  return null;
-}
-
 async function resolveRepoAndBranch(rest: string[]): Promise<{ id: RepoId; branch: string; restAfterBranch: string[] }> {
   const explicit = rest[0] ? parseRepoArg(rest[0]) : null;
   if (explicit) {
@@ -190,9 +166,27 @@ async function resolveOpenPrByBranch(id: RepoId, branch: string): Promise<{ numb
   return pr;
 }
 
+function checkGhCli(): void {
+  try {
+    execSync("gh --version", { stdio: ["pipe", "pipe", "pipe"] });
+  } catch {
+    console.error(
+      "The GitHub CLI (gh) is required but was not found.\n" +
+      "Install it from https://cli.github.com and run `gh auth login` to authenticate."
+    );
+    process.exit(1);
+  }
+}
+
 export async function dispatch(args: string[]): Promise<void> {
   const cmd = args[0];
   const rest = args.slice(1);
+
+  // Commands that interact with GitHub need the gh CLI
+  const needsGh = ["init", "start", "restart", "undo", "retry", "status"];
+  if (cmd && needsGh.includes(cmd) && !rest.includes("--_foreground")) {
+    checkGhCli();
+  }
 
   switch (cmd) {
     case "init":
@@ -425,8 +419,7 @@ export async function dispatch(args: string[]): Promise<void> {
       const { id, branch } = await resolveRepoAndBranch(rest);
       try {
         const pr = await resolveOpenPrByBranch(id, branch);
-        const cwd = ensureWorkspace(id, branch, pr.cloneUrl);
-        void cwd;
+        ensureWorkspace(id, branch, pr.cloneUrl);
         const newHead = rollbackLastCommit(id, branch);
         console.log(`${id.owner}/${id.repo} ${branch}: rolled back last commit, new HEAD ${newHead}`);
       } catch (err: any) {
@@ -566,6 +559,19 @@ export async function dispatch(args: string[]): Promise<void> {
       break;
     }
 
+    case "version":
+    case "--version":
+    case "-v": {
+      const { createRequire } = await import("node:module");
+      const require = createRequire(import.meta.url);
+      const pkg = require("../package.json");
+      console.log(pkg.version);
+      break;
+    }
+
+    case "help":
+    case "--help":
+    case "-h":
     default:
       console.log(`Buffalo — GitHub PR Collaborator Bot
 

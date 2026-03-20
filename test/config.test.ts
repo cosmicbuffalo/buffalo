@@ -85,7 +85,11 @@ describe("config", () => {
       };
       config.saveGlobalConfig(cfg);
       const loaded = config.loadGlobalConfig();
-      assert.deepEqual(loaded, cfg);
+      assert.equal(loaded.githubToken, cfg.githubToken);
+      assert.equal(loaded.botUsername, cfg.botUsername);
+      assert.deepEqual(loaded.authorizedUsers, cfg.authorizedUsers);
+      assert.equal(loaded.defaultBackend, cfg.defaultBackend);
+      assert.equal(loaded.pollIntervalMs, cfg.pollIntervalMs);
     });
   });
 

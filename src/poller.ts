@@ -1,365 +1,20 @@
-import { type RepoId, loadRepoConfig, getAllRepos, workspaceDir } from "./config.js";
-import { fetchPRComments, listOpenPRs, getPullRequest, postComment, postReviewCommentReply, reactToComment, listOpenIssues, fetchIssueComments, getDefaultBranch, createPullRequest, reactToIssue, deleteComment } from "./github.js";
-import { loadSeenCommentIds, saveSeenCommentIds, loadSessions, getSession, setSession, removeSession, markBranchResumable, clearBranchResumable } from "./session-store.js";
-import { loadSeenIssueIds, saveSeenIssueIds, loadSeenIssueCommentIds, saveSeenIssueCommentIds, getIssuePr, setIssuePr } from "./issue-store.js";
-import { ensureWorkspace, commitAndPush, checkAndCleanupMergedPR, createIssueBranch, checkoutNewBranch, renameWorkspaceDir, rollbackLastCommit } from "./repo-manager.js";
+import { type RepoId, loadRepoConfig, getAllRepos } from "./config.js";
+import { fetchPRComments, listOpenPRs, getPullRequest, postComment, reactToComment, deleteComment } from "./github.js";
+import { loadSeenCommentIds, saveSeenCommentIds, loadSessions, getSession, setSession, removeSession } from "./session-store.js";
+import { loadSeenIssueIds, saveSeenIssueIds, loadSeenIssueCommentIds, saveSeenIssueCommentIds } from "./issue-store.js";
+import { ensureWorkspace, checkAndCleanupMergedPR, rollbackLastCommit } from "./repo-manager.js";
 import { startCliSession, monitorSession, handleApproval, readSessionOutput } from "./cli-runner.js";
-import { batchComments, buildPrompt, buildClarificationFollowUp, buildIssuePrompt, buildIssueFollowUpPrompt, extractCommitMessage, extractClarification, extractPerCommentResponses, extractBranchName, extractPRTitle, stripDirectives } from "./batch.js";
-import { appendHistory, readHistory } from "./history.js";
+import { batchComments, buildPrompt, buildClarificationFollowUp, extractClarification, isControlComment, findLastTaskRequest } from "./batch.js";
+import { appendHistory } from "./history.js";
+import { isUndoCommand, isTryAgainCommand, extractTryAgainNote, findLastBotCommentId, rewriteLocalPaths } from "./comment-utils.js";
+import { handlePRSessionCompletion, handleIssueSessionCompletion } from "./completion-handler.js";
+import { pollIssues } from "./issue-poller.js";
+
+// Re-export utilities that tests rely on
+export { rewriteLocalPaths, isUndoCommand, isTryAgainCommand, extractTryAgainNote, findLastBotCommentId } from "./comment-utils.js";
 
 let running = false;
 let pollTimer: ReturnType<typeof setTimeout> | null = null;
-
-/**
- * Replace local workspace file paths in markdown links with GitHub blob URLs.
- * Codex writes links using the absolute local workspace path; we rewrite them
- * to https://github.com/<owner>/<repo>/blob/<branch>/<relative-path>.
- */
-function rewriteLocalPaths(text: string, id: RepoId, branch: string): string {
-  const base = workspaceDir(id, branch);
-  const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-  // Rewrite markdown links with local paths to GitHub blob URLs
-  let result = text.replace(
-    new RegExp(`\\[([^\\]]+)\\]\\(${escaped}/([^)]+)\\)`, "g"),
-    (_, linkText, relPath) =>
-      `[${linkText}](https://github.com/${id.owner}/${id.repo}/blob/${branch}/${relPath})`
-  );
-
-  // Strip the workspace prefix from any remaining bare paths, leaving just the relative path
-  result = result.replace(new RegExp(`${escaped}/`, "g"), "");
-
-  return result;
-}
-
-function isUndoCommand(body: string, botUsername: string): boolean {
-  const lower = body.toLowerCase();
-  return lower.includes(`@${botUsername.toLowerCase()} undo`);
-}
-
-function isTryAgainCommand(body: string, botUsername: string): boolean {
-  const lower = body.toLowerCase();
-  const bot = `@${botUsername.toLowerCase()}`;
-  return lower.includes(`${bot} try again`) || lower.includes(`${bot} retry`);
-}
-
-function isControlComment(body: string, botUsername: string): boolean {
-  const lower = body.toLowerCase();
-  return (
-    lower.includes("allow once") ||
-    lower.includes("allow always") ||
-    lower.includes(`@${botUsername.toLowerCase()} deny`) ||
-    isUndoCommand(body, botUsername) ||
-    isTryAgainCommand(body, botUsername)
-  );
-}
-
-function extractTryAgainNote(body: string): string | null {
-  const match = body.match(/(?:try again|retry)[:\s-]*(.*)$/i);
-  const note = match?.[1]?.trim() ?? "";
-  return note.length > 0 ? note : null;
-}
-
-/**
- * Find the comment ID of the last comment posted by the bot on a given branch/PR.
- * Used by try-again and undo to delete the stale response before retrying.
- */
-function findLastBotCommentId(id: RepoId, branch: string, prNumber: number): number | null {
-  const events = readHistory(id, branch).slice().reverse();
-  for (const e of events) {
-    if (e.type !== "comment_posted") continue;
-    if (e.pr !== prNumber) continue;
-    if (typeof e.comment_id === "number") return e.comment_id;
-  }
-  return null;
-}
-
-function findLastTaskRequest(id: RepoId, branch: string, prNumber: number, botUsername: string): string | null {
-  const events = readHistory(id, branch).slice().reverse();
-  for (const e of events) {
-    if (e.type !== "comment_detected") continue;
-    if (e.pr !== prNumber) continue;
-    const body = typeof e.body === "string" ? e.body : "";
-    if (!body) continue;
-    if (isControlComment(body, botUsername)) continue;
-    return body;
-  }
-  return null;
-}
-
-/**
- * Poll open issues for bot mentions and route them to CLI sessions.
- */
-async function pollIssues(
-  id: RepoId,
-  cfg: ReturnType<typeof loadRepoConfig>,
-  seenIssueIds: Set<number>,
-  seenIssueCommentIds: Set<number>
-): Promise<void> {
-  const botTag = `@${cfg.botUsername}`;
-  const repoLabel = `${id.owner}/${id.repo}`;
-  const cloneUrl = `https://github.com/${id.owner}/${id.repo}.git`;
-
-  let openIssues;
-  try {
-    openIssues = await listOpenIssues(id);
-  } catch (err) {
-    console.warn(`[buffalo] ${repoLabel}: could not list issues:`, err);
-    return;
-  }
-
-  console.log(`[buffalo] ${repoLabel}: ${openIssues.length} open issue(s)`);
-
-  // Step 1: Check issue bodies for bot mentions
-  for (const issue of openIssues) {
-    if (seenIssueIds.has(issue.number)) continue;
-    if (!issue.body?.includes(botTag)) continue;
-    if (!cfg.authorizedUsers.includes(issue.user)) continue;
-
-    console.log(`[buffalo] ${repoLabel}: issue #${issue.number} mentions ${botTag}`);
-
-    // React to the issue
-    await reactToIssue(id, issue.number, "eyes");
-    seenIssueIds.add(issue.number);
-
-    try {
-      const defaultBranch = await getDefaultBranch(id);
-      const tempBranch = `buffalo/issue-${issue.number}`;
-      const cwd = createIssueBranch(id, tempBranch, defaultBranch, cloneUrl);
-
-      const prompt = buildIssuePrompt(issue, botTag);
-      startCliSession(id, tempBranch, prompt, cwd, issue.number, issue.number);
-      setSession(id, tempBranch, {
-        branch: tempBranch,
-        prNumber: issue.number,
-        commentIds: [],
-        triggerComments: [{ user: issue.user, body: issue.body }],
-        status: "running",
-        logOffset: 0,
-        issueNumber: issue.number,
-        issueTitle: issue.title,
-      });
-
-      appendHistory(id, tempBranch, {
-        type: "issue_session_started",
-        issue: issue.number,
-        branch: tempBranch,
-      });
-    } catch (err) {
-      console.error(`[buffalo] Failed to start issue session for #${issue.number}:`, err);
-      seenIssueIds.delete(issue.number);
-    }
-  }
-
-  // Step 2: Check issue comments for bot mentions
-  for (const issue of openIssues) {
-    let comments;
-    try {
-      comments = await fetchIssueComments(id, issue.number, botTag);
-    } catch {
-      continue;
-    }
-
-    const newComments = comments.filter(
-      (c) => !seenIssueCommentIds.has(c.id) && cfg.authorizedUsers.includes(c.user)
-    );
-    if (newComments.length === 0) continue;
-
-    for (const c of newComments) {
-      console.log(`[buffalo] ${repoLabel}: issue #${issue.number} comment ${c.id} mentions ${botTag}`);
-      await reactToComment(id, c.id, "eyes", "issue");
-      seenIssueCommentIds.add(c.id);
-
-      // Handle "try again" specially: delete the bot's stale comment and restart.
-      if (isTryAgainCommand(c.body, cfg.botUsername)) {
-        try {
-          const tempBranch = `buffalo/issue-${issue.number}`;
-          const existingPr = getIssuePr(id, issue.number);
-          const note = extractTryAgainNote(c.body);
-
-          // Delete the bot's last comment on this issue so it doesn't linger.
-          const staleCommentId = findLastBotCommentId(
-            id,
-            existingPr ? existingPr.branch : tempBranch,
-            issue.number
-          );
-          if (staleCommentId) await deleteComment(id, staleCommentId);
-
-          if (existingPr) {
-            // Roll back the last commit on the PR branch and retry.
-            const cwd = ensureWorkspace(id, existingPr.branch, cloneUrl);
-            rollbackLastCommit(id, existingPr.branch);
-            const sessionToUse = {
-              branch: existingPr.branch,
-              prNumber: issue.number,
-              commentIds: [],
-              triggerComments: getSession(id, existingPr.branch)?.triggerComments ?? [],
-              status: "running" as const,
-              logOffset: 0,
-              issueNumber: issue.number,
-              issueTitle: issue.title,
-            };
-            const retryComment = { ...c, body: [
-              "Retry the previous request using a different approach.",
-              note ? `Additional guidance: ${note}` : null,
-            ].filter(Boolean).join("\n") };
-            const prompt = buildIssueFollowUpPrompt(sessionToUse, [retryComment], botTag, existingPr);
-            startCliSession(id, existingPr.branch, prompt, cwd, issue.number, issue.number);
-            setSession(id, existingPr.branch, { ...sessionToUse, commentIds: [c.id], status: "running", logOffset: 0 });
-          } else {
-            // No PR yet — restart the issue session from scratch.
-            const defaultBranch = await getDefaultBranch(id);
-            const cwd = createIssueBranch(id, tempBranch, defaultBranch, cloneUrl);
-            const existingSession = getSession(id, tempBranch);
-            const sessionToUse = existingSession ?? {
-              branch: tempBranch,
-              prNumber: issue.number,
-              commentIds: [],
-              triggerComments: [{ user: issue.user, body: issue.body ?? "" }],
-              status: "running" as const,
-              logOffset: 0,
-              issueNumber: issue.number,
-              issueTitle: issue.title,
-            };
-            const retryComment = { ...c, body: [
-              "Retry the previous request using a different approach.",
-              note ? `Additional guidance: ${note}` : null,
-            ].filter(Boolean).join("\n") };
-            const prompt = buildIssueFollowUpPrompt(sessionToUse, [retryComment], botTag);
-            startCliSession(id, tempBranch, prompt, cwd, issue.number, issue.number);
-            setSession(id, tempBranch, {
-              branch: tempBranch,
-              prNumber: issue.number,
-              commentIds: [c.id],
-              triggerComments: sessionToUse.triggerComments,
-              status: "running",
-              logOffset: 0,
-              issueNumber: issue.number,
-              issueTitle: issue.title,
-            });
-          }
-
-          appendHistory(id, existingPr ? existingPr.branch : tempBranch, {
-            type: "retry_started",
-            pr: issue.number,
-            trigger_comment_id: c.id,
-            by: c.user,
-            note: note ?? "",
-          });
-        } catch (err: any) {
-          console.error(`[buffalo] Failed to handle issue try-again for #${issue.number}:`, err);
-          seenIssueCommentIds.delete(c.id);
-        }
-        continue;
-      }
-
-      try {
-        const existingPr = getIssuePr(id, issue.number);
-
-        if (existingPr) {
-          // Route to the existing PR branch
-          const cwd = ensureWorkspace(id, existingPr.branch, cloneUrl);
-          const existing = getSession(id, existingPr.branch);
-
-          if (existing?.status === "running") {
-            // Session already running — send additional input
-            const tmux = await import("./tmux-manager.js");
-            tmux.sendKeys(
-              id,
-              existingPr.branch,
-              buildIssueFollowUpPrompt(existing, [c], botTag, existingPr)
-            );
-          } else {
-            // Start a new session on the existing PR branch
-            const followUpSession = existing?.status === "waiting_clarification" && existing.pendingClarification
-              ? existing
-              : null;
-
-            const prompt = followUpSession
-              ? buildClarificationFollowUp(
-                  followUpSession,
-                  { prNumber: issue.number, branch: existingPr.branch, comments: [] as any },
-                  botTag
-                )
-              : buildIssueFollowUpPrompt(
-                  {
-                    branch: existingPr.branch,
-                    prNumber: issue.number,
-                    commentIds: [],
-                    triggerComments: [],
-                    status: "running",
-                    logOffset: 0,
-                    issueNumber: issue.number,
-                    issueTitle: issue.title,
-                  },
-                  [c],
-                  botTag,
-                  existingPr
-                );
-
-            startCliSession(id, existingPr.branch, prompt, cwd, issue.number, issue.number);
-            setSession(id, existingPr.branch, {
-              branch: existingPr.branch,
-              prNumber: issue.number,
-              commentIds: [c.id],
-              triggerComments: [{ user: c.user, body: c.body }],
-              status: "running",
-              logOffset: 0,
-              issueNumber: issue.number,
-              issueTitle: issue.title,
-            });
-          }
-        } else {
-          // No existing PR — check if there's an active issue session
-          const tempBranch = `buffalo/issue-${issue.number}`;
-          const existing = getSession(id, tempBranch);
-
-          if (existing?.status === "running") {
-            // Send as additional input to the running session
-            const tmux = await import("./tmux-manager.js");
-            tmux.sendKeys(
-              id,
-              tempBranch,
-              buildIssueFollowUpPrompt(existing, [c], botTag)
-            );
-          } else {
-            // Start a fresh issue session
-            const defaultBranch = await getDefaultBranch(id);
-            const cwd = createIssueBranch(id, tempBranch, defaultBranch, cloneUrl);
-            const sessionToUse = existing ?? {
-              branch: tempBranch,
-              prNumber: issue.number,
-              commentIds: [],
-              triggerComments: [{ user: issue.user, body: issue.body ?? "" }],
-              status: "running" as const,
-              logOffset: 0,
-              issueNumber: issue.number,
-              issueTitle: issue.title,
-            };
-            const prompt = buildIssueFollowUpPrompt(sessionToUse, [c], botTag);
-            startCliSession(id, tempBranch, prompt, cwd, issue.number, issue.number);
-            setSession(id, tempBranch, {
-              branch: tempBranch,
-              prNumber: issue.number,
-              commentIds: [c.id],
-              triggerComments: [
-                ...(existing?.triggerComments ?? [{ user: issue.user, body: issue.body ?? "" }]),
-                { user: c.user, body: c.body },
-              ],
-              status: "running",
-              logOffset: 0,
-              issueNumber: issue.number,
-              issueTitle: issue.title,
-            });
-          }
-        }
-      } catch (err) {
-        console.error(`[buffalo] Failed to handle issue comment ${c.id}:`, err);
-        seenIssueCommentIds.delete(c.id);
-      }
-    }
-  }
-}
 
 /**
  * Run one poll cycle for a single repo.
@@ -431,9 +86,7 @@ async function pollRepo(id: RepoId): Promise<void> {
       if (isUndoCommand(c.body, cfg.botUsername)) {
         try {
           const pr = await getPullRequest(id, c.prNumber);
-          const cwd = ensureWorkspace(id, pr.branch, pr.cloneUrl);
-          // cwd is intentionally computed first to guarantee branch workspace exists.
-          void cwd;
+          ensureWorkspace(id, pr.branch, pr.cloneUrl);
           const newHead = rollbackLastCommit(id, pr.branch);
           // Delete the bot's previous comment so the bad response doesn't linger.
           const staleCommentId = findLastBotCommentId(id, pr.branch, c.prNumber);
@@ -533,10 +186,7 @@ async function pollRepo(id: RepoId): Promise<void> {
 
     // Filter out approval responses for batching — only new task comments
     const taskComments = authorized.filter((c) => {
-      const lower = c.body.toLowerCase();
-      return (
-        !isControlComment(c.body, cfg.botUsername)
-      );
+      return !isControlComment(c.body, cfg.botUsername);
     });
 
     if (taskComments.length > 0) {
@@ -660,10 +310,8 @@ async function pollRepo(id: RepoId): Promise<void> {
         }
 
         if (session.issueNumber !== undefined) {
-          // ── Issue session completion ──────────────────────────────────────
           await handleIssueSessionCompletion(id, branch, session, response, tokensUsed, cfg);
         } else {
-          // ── PR session completion (existing behavior) ─────────────────────
           await handlePRSessionCompletion(id, branch, session, response, tokensUsed, cfg, seenIds);
         }
 
@@ -702,206 +350,6 @@ async function pollRepo(id: RepoId): Promise<void> {
 }
 
 /**
- * Handle completion of an issue-originated session.
- */
-async function handleIssueSessionCompletion(
-  id: RepoId,
-  branch: string,
-  session: import("./session-store.js").SessionInfo,
-  response: string | null,
-  tokensUsed: number | null,
-  cfg: ReturnType<typeof loadRepoConfig>
-): Promise<void> {
-  const n = session.issueNumber!;
-  const finalBranchName = extractBranchName(response);
-
-  if (finalBranchName) {
-    // Agent made code changes and provided a branch name
-    const commitMsg = extractCommitMessage(response) ?? `buffalo: address issue #${n}`;
-
-    try {
-      // Create the git branch from current working-tree state, rename workspace
-      checkoutNewBranch(id, branch, finalBranchName);
-      renameWorkspaceDir(id, branch, finalBranchName);
-
-      const sha = commitAndPush(id, finalBranchName, commitMsg);
-      if (sha) {
-        const defaultBranch = await getDefaultBranch(id);
-        const prTitle =
-          extractPRTitle(response) ??
-          (session.issueTitle ? `Resolve issue #${n}: ${session.issueTitle}` : `Resolve issue #${n}`);
-        const prBodyText = stripDirectives(response) ?? "";
-        const prBody = `${prBodyText}\n\nFixes #${n}`.trim();
-
-        const { number: prNumber, url: prUrl } = await createPullRequest(
-          id,
-          finalBranchName,
-          defaultBranch,
-          prTitle,
-          prBody
-        );
-
-        setIssuePr(id, n, prNumber, finalBranchName);
-        const prLinkCommentId = await postComment(id, n, `I've opened a PR to address this: ${prUrl}`);
-
-        appendHistory(id, branch, {
-          type: "comment_posted",
-          pr: n,
-          comment_id: prLinkCommentId,
-        });
-        appendHistory(id, finalBranchName, {
-          type: "pr_opened",
-          pr: prNumber,
-          issue: n,
-          sha,
-        });
-
-        console.log(`[buffalo] Opened PR #${prNumber} for issue #${n}: ${prUrl}`);
-      } else {
-        // No changes detected — post the response as a comment
-        const displayResponse = stripDirectives(response ? rewriteLocalPaths(response, id, finalBranchName) : null);
-        if (displayResponse) {
-          const commentId = await postComment(id, n, displayResponse);
-          appendHistory(id, branch, { type: "comment_posted", pr: n, comment_id: commentId });
-        }
-      }
-    } catch (err) {
-      console.error(`[buffalo] Failed to create branch/PR for issue #${n}:`, err);
-      // Try to post an error note
-      try {
-        await postComment(id, n, `Sorry, I encountered an error while processing this issue. Please try again.`);
-      } catch {}
-    }
-  } else {
-    // Agent answered without making code changes
-    const commitMsg = extractCommitMessage(response) ?? `buffalo: address issue #${n}`;
-    // Attempt to commit any incidental changes (usually null)
-    commitAndPush(id, branch, commitMsg);
-
-    const displayResponse = stripDirectives(
-      response ? rewriteLocalPaths(response, id, branch) : null
-    );
-    if (displayResponse) {
-      const commentId = await postComment(id, n, displayResponse);
-      appendHistory(id, branch, { type: "comment_posted", pr: n, comment_id: commentId });
-    }
-  }
-}
-
-/**
- * Handle completion of a PR-originated session (existing behavior).
- */
-async function handlePRSessionCompletion(
-  id: RepoId,
-  branch: string,
-  session: import("./session-store.js").SessionInfo,
-  response: string | null,
-  tokensUsed: number | null,
-  cfg: ReturnType<typeof loadRepoConfig>,
-  seenIds: Set<number>
-): Promise<void> {
-  // Use the commit message suggested by the agent if present, otherwise fall back.
-  const commitMsg =
-    extractCommitMessage(response) ?? `buffalo: address PR #${session.prNumber} feedback`;
-
-  // Commit and push any changes the CLI made.
-  const sha = commitAndPush(id, branch, commitMsg);
-  if (sha) {
-    appendHistory(id, branch, {
-      type: "commit_pushed",
-      pr: session.prNumber,
-      sha,
-      message: `buffalo: address PR #${session.prNumber} feedback`,
-    });
-  }
-
-  const triggers = session.triggerComments ?? [];
-  const botTag = `@${cfg.botUsername}`;
-  const backendName = cfg.backend === "claude" ? "Claude" : "Codex";
-
-  const displayResponse = stripDirectives(
-    response ? rewriteLocalPaths(response, id, branch) : null
-  );
-
-  // Shared content used in every reply (commit sha, tokens, response).
-  const sharedParts: string[] = [];
-  if (sha) sharedParts.push(`Pushed commit \`${sha}\`.`);
-  if (tokensUsed != null) {
-    sharedParts.push("");
-    sharedParts.push(`#### Tokens used: ${tokensUsed.toLocaleString()}`);
-  }
-  if (displayResponse) {
-    sharedParts.push("");
-    sharedParts.push(`## ${backendName}'s response:`);
-    sharedParts.push("");
-    sharedParts.push(displayResponse);
-  }
-  const sharedBody = sharedParts.join("\n").trim() || null;
-
-  // Split triggers by type so we can reply inline vs top-level.
-  const reviewTriggers = triggers.filter((t) => t.commentType === "review" && t.commentId);
-  const issueTriggers  = triggers.filter((t) => t.commentType !== "review");
-
-  let postedAny = false;
-
-  // Reply directly to each inline review comment.
-  // Use per-comment RESPONSE[id] text when available; fall back to sharedBody.
-  if (reviewTriggers.length > 0) {
-    const perComment = extractPerCommentResponses(response);
-    for (const t of reviewTriggers) {
-      const specificText = perComment?.get(t.commentId!);
-      const replyBody = specificText
-        ? [
-            specificText,
-            ...(sha ? ["", `Pushed commit \`${sha}\`.`] : []),
-            ...(tokensUsed != null ? ["", `#### Tokens used: ${tokensUsed.toLocaleString()}`] : []),
-          ].join("\n")
-        : sharedBody;
-      if (!replyBody) continue;
-      const commentId = await postReviewCommentReply(id, session.prNumber, t.commentId!, replyBody);
-      appendHistory(id, branch, { type: "comment_posted", pr: session.prNumber, comment_id: commentId });
-      postedAny = true;
-    }
-  }
-
-  // Post a top-level conversation comment for issue-thread triggers (or when
-  // there are no triggers at all, e.g. a manually-started session).
-  if (issueTriggers.length > 0 || reviewTriggers.length === 0) {
-    const topTriggers = issueTriggers.length > 0 ? issueTriggers : triggers;
-    const quoteLines = topTriggers.flatMap((c) => {
-      const body = c.body.replace(new RegExp(botTag, "gi"), "").trim();
-      return body.split("\n").map((l) => `> ${l}`);
-    });
-    const mentions = [...new Set(topTriggers.map((c) => `@${c.user}`))].join(" ");
-
-    const parts: string[] = [];
-    if (quoteLines.length > 0) { parts.push(quoteLines.join("\n")); parts.push(""); }
-    const opener = sha ? `${mentions} Pushed commit \`${sha}\`.`.trim() : mentions;
-    if (opener) parts.push(opener);
-    if (tokensUsed != null) { parts.push(""); parts.push(`#### Tokens used: ${tokensUsed.toLocaleString()}`); }
-    if (displayResponse) { parts.push(""); parts.push(`## ${backendName}'s response:`); parts.push(""); parts.push(displayResponse); }
-
-    const topBody = parts.join("\n").trim() || null;
-    if (topBody) {
-      const commentId = await postComment(id, session.prNumber, topBody);
-      appendHistory(id, branch, { type: "comment_posted", pr: session.prNumber, comment_id: commentId });
-      postedAny = true;
-    }
-  }
-
-  if (postedAny) {
-    // Session produced output — keep context alive for follow-ups.
-    markBranchResumable(id, branch);
-  } else {
-    // No output at all — session likely failed. Clear resume state and
-    // un-see comment IDs so they'll be retried on the next poll.
-    clearBranchResumable(id, branch);
-    console.log(`[buffalo] Session for ${branch} produced no response — marking comments for retry.`);
-    for (const commentId of session.commentIds) seenIds.delete(commentId);
-  }
-}
-
-/**
  * Start the poll loop for specified repos (or all configured repos).
  */
 export function startPolling(repos?: RepoId[]): void {
@@ -926,9 +374,10 @@ export function startPolling(repos?: RepoId[]): void {
       }
     }
     if (running) {
-      const interval = targets[0]
-        ? loadRepoConfig(targets[0]).pollIntervalMs
-        : 15 * 60 * 1000;
+      const interval = Math.min(
+        ...targets.map((t) => loadRepoConfig(t).pollIntervalMs),
+        15 * 60 * 1000
+      );
       pollTimer = setTimeout(poll, interval);
     }
   };

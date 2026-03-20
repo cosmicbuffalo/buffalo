@@ -73,8 +73,8 @@ export async function fetchPRComments(
   botTag: string
 ): Promise<PRComment[]> {
   const [issueComments, reviewComments] = await Promise.all([
-    ghJson<any[]>(["api", `repos/${id.owner}/${id.repo}/issues/${prNumber}/comments?per_page=100`]),
-    ghJson<any[]>(["api", `repos/${id.owner}/${id.repo}/pulls/${prNumber}/comments?per_page=100`]),
+    ghJson<any[]>(["api", "--paginate", `repos/${id.owner}/${id.repo}/issues/${prNumber}/comments?per_page=100`]),
+    ghJson<any[]>(["api", "--paginate", `repos/${id.owner}/${id.repo}/pulls/${prNumber}/comments?per_page=100`]),
   ]);
 
   const comments: PRComment[] = [];
@@ -238,7 +238,7 @@ export async function fetchIssueComments(
   botTag: string
 ): Promise<IssueComment[]> {
   const data = await ghJson<any[]>([
-    "api",
+    "api", "--paginate",
     `repos/${id.owner}/${id.repo}/issues/${issueNumber}/comments?per_page=100`,
   ], getBotToken(id));
 
