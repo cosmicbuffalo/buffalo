@@ -63,7 +63,7 @@ Once running, any authorized user can comment `@buffalo fix the typo in README.m
 buffalo init          # Set up a repo (interactive)
 buffalo start         # Start polling (current repo, or all repos if outside a repo)
 buffalo stop          # Stop polling
-buffalo status        # Show all repos, active sessions, pause state
+buffalo status        # Show all repos, active sessions, pause state, and poller health
 ```
 
 ### Session Management
@@ -90,6 +90,16 @@ buffalo logs feature-branch       # Tail a specific branch's log
 buffalo history                   # Show action history for current branch
 buffalo history feature-branch    # Show action history for a specific branch
 ```
+
+Recent daemon and repo poll errors are written to:
+
+```
+~/.buffalo/daemon-errors.log
+```
+
+If a repo hits repeated poll failures, Buffalo now retries it with exponential backoff instead of stopping all repos.
+
+Buffalo now posts commit SHAs as GitHub links in PR and issue-related comments.
 
 ### Whitelist Management
 

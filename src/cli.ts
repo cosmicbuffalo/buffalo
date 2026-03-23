@@ -14,14 +14,19 @@ import {
   repoDir,
 } from "./config.js";
 import { attachToTarget, attachToWindow, listWindows, destroySession } from "./tmux-manager.js";
-import { pauseSession, resumeSession, loadSessions, clearBranchResumable } from "./session-store.js";
+import { pauseSession, resumeSession, loadSessions, clearBranchResumable, shouldResumeBranch, type SessionInfo } from "./session-store.js";
 import { readHistory } from "./history.js";
 import { listOpenPRs } from "./github.js";
 import { ensureWorkspace, rollbackLastCommit } from "./repo-manager.js";
 import { buildPrompt, isControlComment, findLastTaskRequest } from "./batch.js";
 import { startCliSession } from "./cli-runner.js";
 import { setSession } from "./session-store.js";
-import { startPolling, stopPolling } from "./poller.js";
+import {
+  startPolling,
+  stopPolling,
+  getPollerStatus,
+  getRecentPollerErrors,
+} from "./poller.js";
 import { runInit } from "./init.js";
 
 function getCurrentBranch(): string | null {
@@ -56,6 +61,334 @@ function hasExistingConfig(id: RepoId): boolean {
   return fs.existsSync(
     path.join(repoDir(id), "config.json")
   );
+}
+
+const ANSI = {
+  reset: "\u001b[0m",
+  bold: "\u001b[1m",
+  dim: "\u001b[2m",
+  red: "\u001b[31m",
+  green: "\u001b[32m",
+  yellow: "\u001b[33m",
+  blue: "\u001b[34m",
+  magenta: "\u001b[35m",
+  cyan: "\u001b[36m",
+  gray: "\u001b[90m",
+} as const;
+
+type ColorName = keyof typeof ANSI;
+
+interface StatusRepoSnapshot {
+  id: RepoId;
+  pid: number | null;
+  isPolling: boolean;
+  pollerState: ReturnType<typeof getPollerStatus>;
+  sessions: Record<string, SessionInfo>;
+}
+
+interface StatusRenderOptions {
+  color?: boolean;
+  now?: number;
+  detailed?: boolean;
+}
+
+function shouldUseColor(): boolean {
+  if (process.env.NO_COLOR) return false;
+  if (process.env.FORCE_COLOR && process.env.FORCE_COLOR !== "0") return true;
+  return Boolean(process.stdout?.isTTY) && process.env.TERM !== "dumb";
+}
+
+function paint(text: string, colors: ColorName[], enabled: boolean): string {
+  if (!enabled || colors.length === 0) return text;
+  return `${colors.map((c) => ANSI[c]).join("")}${text}${ANSI.reset}`;
+}
+
+function formatDuration(ms: number): string {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) {
+    const remSeconds = seconds % 60;
+    return remSeconds === 0 ? `${minutes}m` : `${minutes}m ${remSeconds}s`;
+  }
+  const hours = Math.floor(minutes / 60);
+  const remMinutes = minutes % 60;
+  return remMinutes === 0 ? `${hours}h` : `${hours}h ${remMinutes}m`;
+}
+
+function formatRelativeTime(ts: string | undefined, now: number): string | null {
+  if (!ts) return null;
+  const parsed = Date.parse(ts);
+  if (Number.isNaN(parsed)) return null;
+  const delta = Math.max(0, now - parsed);
+  if (delta < 1000) return "just now";
+  return `${formatDuration(delta)} ago`;
+}
+
+function singleLine(text: string | undefined): string | null {
+  if (!text) return null;
+  const normalized = text.replace(/\s+/g, " ").trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function truncate(text: string, max = 88): string {
+  return text.length <= max ? text : `${text.slice(0, max - 3)}...`;
+}
+
+function padCell(text: string, width: number): string {
+  return text.length >= width ? text : `${text}${" ".repeat(width - text.length)}`;
+}
+
+function renderTable(headers: string[], rows: string[][]): string[] {
+  const widths = headers.map((header, index) => {
+    const cellWidths = rows.map((row) => row[index]?.length ?? 0);
+    return Math.max(header.length, ...cellWidths);
+  });
+
+  const formatRow = (row: string[]) =>
+    `  ${row.map((cell, index) => padCell(cell, widths[index])).join(" | ")}`;
+
+  const divider = `  ${widths.map((width) => "-".repeat(width)).join("-+-")}`;
+  return [
+    formatRow(headers),
+    divider,
+    ...rows.map((row) => formatRow(row)),
+  ];
+}
+
+function humanizeSessionStatus(status: SessionInfo["status"]): string {
+  switch (status) {
+    case "running":
+      return "Running";
+    case "waiting_approval":
+      return "Waiting For Approval";
+    case "waiting_clarification":
+      return "Waiting For Clarification";
+    case "completed":
+      return "Completed";
+    case "paused":
+      return "Paused";
+  }
+}
+
+function humanizeErrorKind(kind: string): string {
+  return kind.replace(/_/g, " ");
+}
+
+function sessionStatusColor(status: SessionInfo["status"]): ColorName[] {
+  switch (status) {
+    case "running":
+      return ["green", "bold"];
+    case "waiting_approval":
+      return ["yellow", "bold"];
+    case "waiting_clarification":
+      return ["magenta", "bold"];
+    case "completed":
+      return ["cyan", "bold"];
+    case "paused":
+      return ["blue", "bold"];
+  }
+}
+
+function summarizeHistoryEvent(event: Record<string, unknown> | undefined): string | null {
+  if (!event) return null;
+  switch (event.type) {
+    case "cli_started":
+      return "agent session started";
+    case "comment_detected":
+      return `new comment from @${event.author ?? "unknown"}`;
+    case "clarification_answered":
+      return "clarification received";
+    case "clarification_requested":
+      return "clarification requested from reviewer";
+    case "command_requested":
+      return event.approved ? "command auto-approved" : `approval requested for ${event.failedPart ?? event.command ?? "command"}`;
+    case "command_approved":
+      return "command approved";
+    case "command_denied":
+      return "command denied";
+    case "comment_posted":
+      return "posted response back to GitHub";
+    case "commit_pushed":
+      return `pushed commit ${String(event.sha ?? "").slice(0, 7)}`;
+    case "retry_started":
+      return "retry started";
+    case "undo_applied":
+      return "rolled back latest commit";
+    case "pr_opened":
+      return `opened PR #${event.pr ?? "?"}`;
+    case "issue_session_started":
+      return `started issue session #${event.issue ?? "?"}`;
+    default:
+      return String(event.type).replace(/_/g, " ");
+  }
+}
+
+function describeSessionActivity(
+  id: RepoId,
+  branch: string,
+  session: SessionInfo,
+  now: number
+): { current: string; last: string | null; request: string | null; history: string[] } {
+  const history = readHistory(id, branch);
+  const lastEvent = history.length > 0 ? history[history.length - 1] : undefined;
+  const lastSummary = summarizeHistoryEvent(lastEvent);
+  const lastWhen = formatRelativeTime(lastEvent?.ts, now);
+  const last = lastSummary ? `${lastSummary}${lastWhen ? ` (${lastWhen})` : ""}` : null;
+  const recentHistory = history
+    .slice(-3)
+    .reverse()
+    .map((event) => {
+      const summary = summarizeHistoryEvent(event);
+      const when = formatRelativeTime(event.ts, now);
+      if (!summary) return null;
+      return `${summary}${when ? ` (${when})` : ""}`;
+    })
+    .filter((entry): entry is string => Boolean(entry));
+
+  let current: string;
+  if (session.status === "waiting_approval" && session.pendingApproval) {
+    current = `awaiting approval for \`${session.pendingApproval.failedPart}\``;
+  } else if (session.status === "waiting_clarification" && session.pendingClarification) {
+    current = `awaiting clarification: ${truncate(singleLine(session.pendingClarification.question) ?? "reviewer response needed")}`;
+  } else if (session.status === "paused") {
+    current = "paused by user";
+  } else if (lastSummary) {
+    current = lastSummary;
+  } else if (shouldResumeBranch(id, branch)) {
+    current = "ready to resume previous Codex thread on the next comment";
+  } else {
+    current = "session active";
+  }
+
+  const trigger = session.triggerComments?.[session.triggerComments.length - 1];
+  const request = trigger
+    ? `@${trigger.user}: ${truncate(singleLine(trigger.body) ?? "(empty comment)")}`
+    : null;
+
+  return { current, last, request, history: recentHistory };
+}
+
+export function renderStatusReport(
+  repos: StatusRepoSnapshot[],
+  recentErrors: Array<{ ts: string; kind: string; repo?: string; message: string }>,
+  options: StatusRenderOptions = {}
+): string {
+  const color = options.color ?? shouldUseColor();
+  const now = options.now ?? Date.now();
+  const detailed = options.detailed ?? false;
+
+  if (repos.length === 0) {
+    return "No repos configured. Run `buffalo init`.";
+  }
+
+  const lines: string[] = [];
+  lines.push(paint("Buffalo Status", ["bold", "cyan"], color));
+
+  for (const repo of repos) {
+    if (lines.length > 1) lines.push("");
+    lines.push(paint(`${repo.id.owner}/${repo.id.repo}`, ["bold"], color));
+
+    const pollerLabel = repo.isPolling
+      ? paint(`RUNNING (pid ${repo.pid})`, ["green", "bold"], color)
+      : paint("STOPPED", ["red", "bold"], color);
+    lines.push(`  Poller: ${pollerLabel}`);
+
+    if (repo.pollerState) {
+      if (repo.pollerState.failureCount > 0) {
+        const retryIn = Math.max(0, repo.pollerState.nextPollAt - now);
+        lines.push(
+          `  Health: ${paint("degraded", ["yellow", "bold"], color)}; retry in ${formatDuration(retryIn)} after ${repo.pollerState.failureCount} failure(s)`
+        );
+        if (repo.pollerState.lastError) {
+          lines.push(`  Error: ${truncate(singleLine(repo.pollerState.lastError) ?? repo.pollerState.lastError, 120)}`);
+        }
+        if (repo.pollerState.lastErrorAt) {
+          lines.push(`  Error Time: ${new Date(repo.pollerState.lastErrorAt).toLocaleString()}`);
+        }
+      } else {
+        const nextPollIn = Math.max(0, repo.pollerState.nextPollAt - now);
+        lines.push(`  Health: ${paint("healthy", ["green"], color)}; next poll in ${formatDuration(nextPollIn)}`);
+      }
+      if (detailed) {
+        lines.push(`  Next Poll At: ${new Date(repo.pollerState.nextPollAt).toLocaleString()}`);
+      }
+    } else if (detailed) {
+      lines.push(`  Health: ${paint("unknown", ["gray"], color)}; poller has not reported state yet`);
+    }
+
+    const entries = Object.entries(repo.sessions).sort(([a], [b]) => a.localeCompare(b));
+    if (entries.length === 0) {
+      lines.push(`  Sessions: ${paint("none", ["gray"], color)}`);
+      if (detailed) {
+        try {
+          const cfg = loadRepoConfig(repo.id);
+          lines.push(`  Backend: ${cfg.backend}`);
+          lines.push(`  Poll Interval: ${formatDuration(cfg.pollIntervalMs)}`);
+        } catch {
+          // Ignore missing config here; dispatch validates targeted repos.
+        }
+      }
+      continue;
+    }
+
+    if (detailed) {
+      try {
+        const cfg = loadRepoConfig(repo.id);
+        lines.push(`  Backend: ${cfg.backend}`);
+        lines.push(`  Poll Interval: ${formatDuration(cfg.pollIntervalMs)}`);
+      } catch {
+        // Ignore missing config here; dispatch validates targeted repos.
+      }
+    }
+
+    lines.push(`  Sessions: ${entries.length} active`);
+    for (const [branch, session] of entries) {
+      const label = paint(humanizeSessionStatus(session.status), sessionStatusColor(session.status), color);
+      const activity = describeSessionActivity(repo.id, branch, session, now);
+      lines.push(`    - ${branch}  PR #${session.prNumber}  ${label}`);
+      lines.push(`      Current: ${activity.current}`);
+      if (activity.request) lines.push(`      Request: ${activity.request}`);
+      if (activity.last && activity.last !== activity.current) {
+        lines.push(`      Last: ${activity.last}`);
+      }
+      if (detailed) {
+        if (shouldResumeBranch(repo.id, branch)) {
+          lines.push(`      Resume: yes`);
+        }
+        if (session.pendingApproval) {
+          lines.push(`      Approval Command: ${session.pendingApproval.command}`);
+        }
+        if (session.pendingClarification) {
+          lines.push(`      Clarification: ${truncate(singleLine(session.pendingClarification.question) ?? session.pendingClarification.question, 120)}`);
+        }
+        if (activity.history.length > 0) {
+          lines.push(`      Recent Activity:`);
+          for (const entry of activity.history) {
+            lines.push(`        ${entry}`);
+          }
+        }
+      }
+    }
+  }
+
+  if (recentErrors.length > 0) {
+    lines.push("");
+    lines.push(paint("Recent Poller Errors", ["bold", "red"], color));
+    lines.push(
+      ...renderTable(
+        ["remote", "time", "error", "message"],
+        recentErrors.map((event) => [
+          event.repo ?? "-",
+          formatRelativeTime(event.ts, now) ?? event.ts,
+          humanizeErrorKind(event.kind),
+          truncate(singleLine(event.message) ?? event.message, 80),
+        ])
+      )
+    );
+  }
+
+  return lines.join("\n");
 }
 
 /**
@@ -201,6 +534,21 @@ export async function dispatch(args: string[]): Promise<void> {
         if (!id) { console.error("Internal error: no repo for foreground mode"); process.exit(1); }
         writePidFile(id, process.pid);
         startPolling([id]);
+        const handleFatal = (label: string, err: unknown) => {
+          console.error(`[buffalo] ${label}:`, err);
+          stopPolling();
+          if (readPidFile(id) === process.pid) removePidFile(id);
+          process.exit(1);
+        };
+
+        process.on("uncaughtException", (err) => {
+          handleFatal("Uncaught exception", err);
+        });
+
+        process.on("unhandledRejection", (err) => {
+          handleFatal("Unhandled promise rejection", err);
+        });
+
         const cleanExit = () => {
           stopPolling();
           // Only remove the PID file if it still contains our own PID.
@@ -290,25 +638,33 @@ export async function dispatch(args: string[]): Promise<void> {
     }
 
     case "status": {
-      const repos = getAllRepos();
-      if (repos.length === 0) {
-        console.log("No repos configured. Run `buffalo init`.");
-        break;
+      const requestedRepo = rest[0] ? parseRepoArg(rest[0]) : null;
+      if (rest[0] && !requestedRepo) {
+        console.error("Usage: buffalo status [owner/repo]");
+        process.exit(1);
       }
-      for (const id of repos) {
+
+      const allRepos = getAllRepos();
+      const repos = requestedRepo
+        ? allRepos.filter((id) => id.owner === requestedRepo.owner && id.repo === requestedRepo.repo)
+        : allRepos;
+
+      if (requestedRepo && repos.length === 0) {
+        console.error(`${requestedRepo.owner}/${requestedRepo.repo} is not an initialized Buffalo repo.`);
+        process.exit(1);
+      }
+
+      const repoSnapshots = repos.map((id) => {
         const pid = readPidFile(id);
-        const polling = pid && isProcessRunning(pid) ? `polling (pid ${pid})` : "not polling";
-        console.log(`\n${id.owner}/${id.repo}: [${polling}]`);
-        const sessions = loadSessions(id);
-        const entries = Object.entries(sessions.sessions);
-        if (entries.length === 0) {
-          console.log("  No active sessions");
-        } else {
-          for (const [branch, s] of entries) {
-            console.log(`  ${branch}: PR #${s.prNumber} [${s.status}]`);
-          }
-        }
-      }
+        return {
+          id,
+          pid,
+          isPolling: pid !== null && isProcessRunning(pid),
+          pollerState: getPollerStatus(id),
+          sessions: loadSessions(id).sessions,
+        };
+      });
+      console.log(renderStatusReport(repoSnapshots, getRecentPollerErrors(3), { detailed: Boolean(requestedRepo) }));
       break;
     }
 

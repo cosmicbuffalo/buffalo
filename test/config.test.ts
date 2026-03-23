@@ -90,6 +90,7 @@ describe("config", () => {
       assert.deepEqual(loaded.authorizedUsers, cfg.authorizedUsers);
       assert.equal(loaded.defaultBackend, cfg.defaultBackend);
       assert.equal(loaded.pollIntervalMs, cfg.pollIntervalMs);
+      assert.equal(loaded.idleTimeoutMs, 90_000); // default applied
     });
   });
 

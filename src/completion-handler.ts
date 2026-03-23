@@ -1,9 +1,9 @@
 import { type RepoId, loadRepoConfig } from "./config.js";
 import { postComment, postReviewCommentReply, getDefaultBranch, createPullRequest } from "./github.js";
-import { type SessionInfo, setSession, removeSession, markBranchResumable, clearBranchResumable } from "./session-store.js";
+import { type SessionInfo, markBranchResumable, clearBranchResumable } from "./session-store.js";
 import { setIssuePr } from "./issue-store.js";
 import { commitAndPush, checkoutNewBranch, renameWorkspaceDir } from "./repo-manager.js";
-import { extractCommitMessage, extractClarification, extractPerCommentResponses, extractBranchName, extractPRTitle, stripDirectives } from "./batch.js";
+import { extractCommitMessage, extractPerCommentResponses, extractBranchName, extractPRTitle, stripDirectives } from "./batch.js";
 import { appendHistory } from "./history.js";
 import { rewriteLocalPaths } from "./comment-utils.js";
 

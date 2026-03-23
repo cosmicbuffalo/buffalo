@@ -1,4 +1,6 @@
-import { type RepoId, loadRepoConfig, getAllRepos } from "./config.js";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { type RepoId, loadRepoConfig, getAllRepos, daemonErrorLog, ensureDir } from "./config.js";
 import { fetchPRComments, listOpenPRs, getPullRequest, postComment, reactToComment, deleteComment } from "./github.js";
 import { loadSeenCommentIds, saveSeenCommentIds, loadSessions, getSession, setSession, removeSession } from "./session-store.js";
 import { loadSeenIssueIds, saveSeenIssueIds, loadSeenIssueCommentIds, saveSeenIssueCommentIds } from "./issue-store.js";
@@ -15,6 +17,137 @@ export { rewriteLocalPaths, isUndoCommand, isTryAgainCommand, extractTryAgainNot
 
 let running = false;
 let pollTimer: ReturnType<typeof setTimeout> | null = null;
+
+const DEFAULT_POLL_INTERVAL_MS = 15 * 60 * 1000;
+const MIN_RETRY_DELAY_MS = 30_000;
+const MAX_RETRY_DELAY_MS = 15 * 60 * 1000;
+
+interface RepoPollState {
+  id: RepoId;
+  intervalMs: number;
+  failureCount: number;
+  nextPollAt: number;
+  lastErrorAt?: number;
+  lastError?: string;
+}
+
+const pollerStates = new Map<string, RepoPollState>();
+
+type PollerErrorKind =
+  | "repo_poll_error"
+  | "repo_poll_recovered"
+  | "poller_stopped"
+  | "poller_started"
+  | "poller_fatal_error";
+
+interface PollerErrorEvent {
+  ts: string;
+  kind: PollerErrorKind;
+  repo?: string;
+  message: string;
+}
+
+interface PollerStatus {
+  repo: RepoId;
+  intervalMs: number;
+  failureCount: number;
+  nextPollAt: number;
+  lastError?: string;
+  lastErrorAt?: number;
+}
+
+function commitLink(id: RepoId, sha: string): string {
+  return `[\`${sha}\`](https://github.com/${id.owner}/${id.repo}/commit/${sha})`;
+}
+
+function repoKey(id: RepoId): string {
+  return `${id.owner}/${id.repo}`;
+}
+
+function parseErrorMessage(err: unknown): string {
+  if (err instanceof Error) {
+    return err.stack ?? err.message;
+  }
+  try {
+    return String((err as { message?: unknown })?.message ?? err);
+  } catch {
+    return "Unknown error";
+  }
+}
+
+function logPollerError(kind: PollerErrorKind, repo: RepoId | null, err: unknown): void {
+  const event: PollerErrorEvent = {
+    ts: new Date().toISOString(),
+    kind,
+    message: parseErrorMessage(err),
+  };
+
+  if (repo) event.repo = repoKey(repo);
+  try {
+    ensureDir(path.dirname(daemonErrorLog()));
+  } catch {}
+
+  try {
+    fs.appendFileSync(daemonErrorLog(), `${JSON.stringify(event)}\n`);
+  } catch {
+    // Non-critical: best-effort visibility into poller errors.
+  }
+}
+
+function computeBackoffMs(state: RepoPollState): number {
+  const fail = Math.max(1, state.failureCount);
+  const base = Math.max(state.intervalMs, MIN_RETRY_DELAY_MS);
+  const exponential = base * Math.pow(2, fail - 1);
+  return Math.min(exponential, MAX_RETRY_DELAY_MS);
+}
+
+function getState(id: RepoId): RepoPollState {
+  const key = repoKey(id);
+  const existing = pollerStates.get(key);
+  if (existing) return existing;
+
+  const intervalMs = loadRepoConfig(id).pollIntervalMs;
+  const state: RepoPollState = {
+    id,
+    intervalMs,
+    failureCount: 0,
+    nextPollAt: Date.now(),
+  };
+  pollerStates.set(key, state);
+  return state;
+}
+
+function formatDelay(ms: number): number {
+  return Math.max(1, Math.ceil(ms / 1000));
+}
+
+function markRepoFailure(id: RepoId, err: unknown): RepoPollState {
+  const state = getState(id);
+  state.failureCount += 1;
+  state.lastErrorAt = Date.now();
+  state.lastError = parseErrorMessage(err);
+  state.nextPollAt = Date.now() + computeBackoffMs(state);
+
+  console.warn(
+    `[buffalo] Polling ${repoKey(id)} failed (${state.failureCount} consecutive failure(s)). ` +
+    `Retry in ${formatDelay(state.nextPollAt - Date.now())}s. Error: ${state.lastError}`
+  );
+  logPollerError("repo_poll_error", id, err);
+  return state;
+}
+
+function markRepoRecovered(id: RepoId): RepoPollState {
+  const state = getState(id);
+  if (state.failureCount > 0) {
+    const previous = state.failureCount;
+    state.failureCount = 0;
+    state.lastError = undefined;
+    state.lastErrorAt = undefined;
+    logPollerError("repo_poll_recovered", id, `Recovered after ${previous} failure(s).`);
+  }
+  state.nextPollAt = Date.now() + state.intervalMs;
+  return state;
+}
 
 /**
  * Run one poll cycle for a single repo.
@@ -352,6 +485,54 @@ async function pollRepo(id: RepoId): Promise<void> {
 /**
  * Start the poll loop for specified repos (or all configured repos).
  */
+export function getPollerStatuses(): PollerStatus[] {
+  return Array.from(pollerStates.values()).map((state) => ({
+    repo: state.id,
+    intervalMs: state.intervalMs,
+    failureCount: state.failureCount,
+    nextPollAt: state.nextPollAt,
+    lastError: state.lastError,
+    lastErrorAt: state.lastErrorAt,
+  }));
+}
+
+export function getPollerStatus(id: RepoId): PollerStatus | null {
+  const state = pollerStates.get(repoKey(id));
+  if (!state) return null;
+  return {
+    repo: state.id,
+    intervalMs: state.intervalMs,
+    failureCount: state.failureCount,
+    nextPollAt: state.nextPollAt,
+    lastError: state.lastError,
+    lastErrorAt: state.lastErrorAt,
+  };
+}
+
+export function getRecentPollerErrors(limit = 10): PollerErrorEvent[] {
+  try {
+    const raw = fs.readFileSync(daemonErrorLog(), "utf-8");
+    return raw
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .slice(-limit)
+      .map((line) => {
+        try {
+          return JSON.parse(line) as PollerErrorEvent;
+        } catch {
+          return {
+            ts: new Date().toISOString(),
+            kind: "poller_fatal_error" as const,
+            message: line,
+          };
+        }
+      });
+  } catch {
+    return [];
+  }
+}
+
 export function startPolling(repos?: RepoId[]): void {
   const targets = repos ?? getAllRepos();
   if (targets.length === 0) {
@@ -359,26 +540,67 @@ export function startPolling(repos?: RepoId[]): void {
     return;
   }
 
+  const activeTargets: RepoId[] = [];
+  for (const id of targets) {
+    try {
+      const intervalMs = loadRepoConfig(id).pollIntervalMs || DEFAULT_POLL_INTERVAL_MS;
+      const state = getState(id);
+      state.failureCount = 0;
+      state.lastError = undefined;
+      state.lastErrorAt = undefined;
+      state.nextPollAt = Date.now();
+      state.intervalMs = intervalMs;
+      activeTargets.push(id);
+    } catch (err) {
+      console.error(`[buffalo] Failed to initialize poller for ${repoKey(id)}:`, err);
+      logPollerError("repo_poll_error", id, err);
+    }
+  }
+
+  if (activeTargets.length === 0) {
+    console.error("[buffalo] No repos could be initialized for polling.");
+    return;
+  }
+
   running = true;
-  console.log(`[buffalo] Starting poll loop for ${targets.length} repo(s)`);
+  const skipped = targets.length - activeTargets.length;
+  if (skipped > 0) {
+    console.warn(`[buffalo] Skipped ${skipped} repo(s) due to errors during initialization.`);
+  }
+
+  logPollerError("poller_started", activeTargets[0], `${activeTargets.length} repo(s)`);
+  console.log(`[buffalo] Starting poll loop for ${activeTargets.length} repo(s)`);
 
   const poll = async () => {
     if (!running) return;
-    for (const id of targets) {
-      try {
-        await pollRepo(id);
-      } catch (err) {
-        console.error(`[buffalo] Fatal error — stopping poller.`);
-        stopPolling();
-        return;
+    let nextDelayMs = DEFAULT_POLL_INTERVAL_MS;
+
+    try {
+      const now = Date.now();
+      for (const id of activeTargets) {
+        const state = getState(id);
+        if (state.nextPollAt > now) {
+          nextDelayMs = Math.min(nextDelayMs, state.nextPollAt - now);
+          continue;
+        }
+
+        try {
+          await pollRepo(id);
+          const recovered = markRepoRecovered(id);
+          nextDelayMs = Math.min(nextDelayMs, recovered.intervalMs);
+        } catch (err) {
+          const failed = markRepoFailure(id, err);
+          nextDelayMs = Math.min(nextDelayMs, failed.nextPollAt - Date.now());
+        }
       }
+    } catch (err) {
+      console.error(`[buffalo] Fatal error — stopping poller.`);
+      logPollerError("poller_fatal_error", null, err);
+      stopPolling();
+      return;
     }
     if (running) {
-      const interval = Math.min(
-        ...targets.map((t) => loadRepoConfig(t).pollIntervalMs),
-        15 * 60 * 1000
-      );
-      pollTimer = setTimeout(poll, interval);
+      pollTimer = setTimeout(poll, Math.max(1_000, nextDelayMs));
     }
   };
 
@@ -389,10 +611,16 @@ export function startPolling(repos?: RepoId[]): void {
  * Stop the poll loop.
  */
 export function stopPolling(): void {
+  if (!running) {
+    console.log("[buffalo] Polling stopped.");
+    return;
+  }
+
   running = false;
   if (pollTimer) {
     clearTimeout(pollTimer);
     pollTimer = null;
   }
+  logPollerError("poller_stopped", null, "Polling stopped by command.");
   console.log("[buffalo] Polling stopped.");
 }
