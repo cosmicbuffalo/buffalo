@@ -14,6 +14,7 @@ export interface GlobalConfig {
   authorizedUsers: string[];
   defaultBackend: "claude" | "codex";
   pollIntervalMs: number;
+  idleTimeoutMs?: number;
 }
 
 export interface RepoConfig {
@@ -21,6 +22,7 @@ export interface RepoConfig {
   authorizedUsers: string[];
   backend: "claude" | "codex";
   pollIntervalMs: number;
+  idleTimeoutMs?: number;
   githubToken?: string;
 }
 
@@ -119,6 +121,7 @@ const DEFAULT_GLOBAL: GlobalConfig = {
   authorizedUsers: [],
   defaultBackend: "claude",
   pollIntervalMs: 15 * 60 * 1000,
+  idleTimeoutMs: 90_000,
 };
 
 export function loadGlobalConfig(): GlobalConfig {
@@ -140,6 +143,7 @@ export function loadRepoConfig(id: RepoId): RepoConfig {
     authorizedUsers: global.authorizedUsers,
     backend: global.defaultBackend,
     pollIntervalMs: global.pollIntervalMs,
+    idleTimeoutMs: global.idleTimeoutMs,
   };
   const repo = readJson<Partial<RepoConfig>>(
     path.join(repoDir(id), "config.json"),

@@ -14,17 +14,17 @@ Code review bots that run in opaque containers give you no visibility and no esc
 curl -fsSL https://raw.githubusercontent.com/cosmicbuffalo/buffalo/main/install.sh | sh
 ```
 
-Requires **Node >= 22** and **tmux**.
+Requires **Node >= 22**, **tmux**, and the **GitHub CLI (`gh`)** (authenticated with `gh auth login`).
 
 ## Setting Up a Bot Account
 
 Buffalo works best with a dedicated GitHub account that acts as the bot. This keeps bot activity separate from your personal account and makes it obvious which comments and commits came from automation.
 
 1. **Create a new GitHub account** (e.g. `my-buffalo-bot`). Use a separate email address.
-2. **Generate a Personal Access Token** on the bot account:
-   - Go to Settings > Developer settings > Personal access tokens > Fine-grained tokens
-   - Create a token scoped to the repos Buffalo will operate on
-   - Required permissions: **Read and Write** access to **Contents**, **Issues**, and **Pull requests**
+2. **Generate a Personal Access Token (classic)** on the bot account:
+   - Go to Settings > Developer settings > Personal access tokens > **Tokens (classic)**
+   - Create a token with the **`repo`** scope
+   - Fine-grained tokens don't support repos where the bot is an outside collaborator, so use a classic token
 3. **Add the bot as a collaborator** on each repo (Settings > Collaborators). It needs write access to push commits and post comments.
 4. **Run `buffalo init`** and paste the bot account's token when prompted.
 
@@ -51,7 +51,7 @@ Once running, any authorized user can comment `@buffalo fix the typo in README.m
 
 1. Clone the PR's branch
 2. Open a tmux window and run the CLI agent with the request
-3. Auto-approve whitelisted commands, escalate everything else
+3. Auto-approve whitelisted commands, escalate everything else (Codex only — see [Backend Differences](#backend-differences))
 4. Commit and push the changes
 5. Reply on the PR with what it did
 
@@ -109,9 +109,22 @@ buffalo whitelist add "^docker\b" # Add a regex pattern
 buffalo whitelist remove 3        # Remove pattern by index
 ```
 
-## Command Approval
+## Backend Differences
 
-Buffalo enforces a regex-based whitelist on every command the CLI agent wants to run. Compound commands (`&&`, `||`, `;`, `|`, `$()`, backticks) are split apart and each piece is checked independently.
+Buffalo supports two CLI backends, and they behave differently:
+
+| | **Codex** | **Claude** |
+|---|---|---|
+| Mode | Interactive (`codex exec`) | Non-interactive (`claude --print`) |
+| Command approval | Whitelist enforced, unapproved commands escalated via PR comment | Not applicable — `--print` runs non-interactively with no command prompts |
+| Session resume | Supported (`codex exec resume`) | Not supported (always starts fresh) |
+| Pause / resume | Full support (agent keeps running in tmux) | Agent runs to completion, no mid-session pause |
+
+**If you choose Claude as your backend**, the command whitelist and approval system described below do not apply. Claude runs in single-shot mode and manages its own tool use. The whitelist is only relevant for Codex sessions.
+
+## Command Approval (Codex only)
+
+Buffalo enforces a regex-based whitelist on every command the Codex agent wants to run. Compound commands (`&&`, `||`, `;`, `|`, `$()`, backticks) are split apart and each piece is checked independently.
 
 **Default safe patterns** (pre-populated on init):
 
@@ -138,7 +151,11 @@ When a command isn't whitelisted, Buffalo posts a PR comment:
 
 ### Polling
 
-Buffalo polls `GET /repos/{owner}/{repo}/issues/comments?since={last_check}` every 15 minutes (configurable). Only comments from authorized users that mention the bot tag are processed. It also checks whether tracked PRs have been merged or closed, and cleans up accordingly.
+Buffalo polls GitHub for new comments every 15 minutes by default (configurable via `pollIntervalMs`). Only comments from authorized users that mention the bot tag are processed. It also checks whether tracked PRs have been merged or closed, and cleans up accordingly.
+
+For faster response times, lower `pollIntervalMs` in your config (e.g. `60000` for 1 minute). Keep in mind that GitHub's API rate limit is 5,000 requests/hour for authenticated users — each poll cycle makes several API calls per repo, so very aggressive intervals with many repos could hit limits.
+
+> **Note:** Buffalo is purely polling-based. There is no webhook support, so there will always be some latency between a comment being posted and Buffalo acting on it.
 
 ### tmux Layout
 
@@ -215,7 +232,7 @@ History files persist after cleanup so you always have an audit trail.
 
 ```json
 {
-  "botTag": "@buffalo",
+  "botUsername": "my-buffalo-bot",
   "authorizedUsers": ["alice"],
   "backend": "codex",
   "pollIntervalMs": 300000,
@@ -232,7 +249,7 @@ git clone <repo-url>
 cd buffalo
 npm install
 npm run build
-npm test          # 80 tests across 8 test files
+npm test          # runs all tests
 ```
 
 Tests use Node's built-in test runner, temp directories for filesystem isolation, real tmux sessions for integration tests, and local bare git repos for clone/push verification. No mocking frameworks — just the standard library.
